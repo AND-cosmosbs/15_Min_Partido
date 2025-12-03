@@ -3,6 +3,14 @@
 import streamlit as st
 import pandas as pd
 
+import os
+import sys
+
+# --- AÑADIR RAÍZ DEL PROYECTO AL PYTHONPATH ---
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
 from backend.model import (
     load_historical_data,
     compute_team_and_league_stats,
