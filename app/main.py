@@ -1,161 +1,192 @@
-# app/main.py
-
 import os
 import sys
 
 import streamlit as st
 import pandas as pd
 
-# --- AÑADIR RAÍZ DEL PROYECTO AL PYTHONPATH ---
+# -------------------------------------------------------------------
+# AÑADIR RAÍZ DEL PROYECTO AL PYTHONPATH PARA PODER IMPORTAR backend
+# -------------------------------------------------------------------
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
-# --- IMPORTAR LÓGICA DEL MODELO ---
 from backend.model import (
     load_historical_data,
     compute_team_and_league_stats,
     score_fixtures,
 )
 
-
-# ---------- CARGA DEL HISTÓRICO (CACHEADO) ----------
-@st.cache_data(show_spinner=True)
+# -------------------------------------------------------------------
+# CARGA DE HISTÓRICO + ESTADÍSTICAS (CACHEADO)
+# -------------------------------------------------------------------
+@st.cache_resource(show_spinner=True)
 def _load_hist_and_stats():
     """
-    Carga los históricos de /data, calcula stats de equipos y ligas
-    y los devuelve cacheados.
+    Carga todos los all-euro-data-*.xls* desde /data
+    y calcula estadísticas de ligas y equipos.
     """
-    hist = load_historical_data("data")
+    hist = load_historical_data("data")  # busca en /opt/render/project/src/data
     team_stats, div_stats = compute_team_and_league_stats(hist)
     return hist, team_stats, div_stats
 
 
-# ---------- APP PRINCIPAL ----------
+# -------------------------------------------------------------------
+# APLICACIÓN PRINCIPAL
+# -------------------------------------------------------------------
 def main():
     st.set_page_config(
-        page_title="Selector de partidos HT/FT",
+        page_title="Selector de Partidos HT Estrategia",
         layout="wide",
     )
 
-    st.title("Selector de partidos – Estrategia HT/FT 0–0 al descanso")
+    st.title("Selector de partidos – Estrategia HT (BTTS NO + U3.5 + 1-1)")
     st.markdown(
         """
-        Esta app:
-        1. Usa tu histórico (3 temporadas).
-        2. Calcula perfil de ligas y equipos.
-        3. Clasifica los partidos del fixture en: **Ideal / Buena / Borderline / Descartar**.
-        4. Aplica el filtro de **no favorito claro** (min(B365H, B365A) ≥ 2.0).
+Esta app:
+
+1. Carga el histórico de **Football-Data** (all-euro-data-*.xls*) desde la carpeta `/data`.
+2. Calcula perfiles de **ligas** y **equipos**.
+3. Clasifica los partidos del **fixtures.xlsx** en:
+   - `Ideal`
+   - `Buena`
+   - `Borderline`
+   - `Descartar`
+4. Aplica los filtros extra que definimos:
+   - Sin favorito claro (**min(B365H, B365A) ≥ 2.0**).
+   - Marca los partidos seleccionados como:
+     - `Ideal`
+     - `Buena filtrada`
         """
     )
 
-    # --- Cargar histórico y stats ---
-    with st.spinner("Cargando histórico y calculando estadísticas de ligas/equipos..."):
+    # ---------------------------
+    # CARGA DEL HISTÓRICO
+    # ---------------------------
+    with st.spinner("Cargando histórico y calculando estadísticas..."):
         hist, team_stats, div_stats = _load_hist_and_stats()
+
     st.success("Histórico cargado correctamente.")
 
-    st.markdown("### 1. Cargar fixture (Football-Data)")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Partidos históricos", f"{len(hist):,}".replace(",", "."))
+    with col2:
+        st.metric("Equipos", f"{team_stats['Team'].nunique():,}".replace(",", "."))
+    with col3:
+        st.metric("Ligas", f"{div_stats['Div'].nunique():,}".replace(",", "."))
 
-    uploaded_file = st.file_uploader(
-        "Sube el fichero `fixtures.xlsx` tal cual lo descargas de football-data.co.uk",
-        type=["xlsx", "xls"],
+    st.markdown("---")
+
+    # ---------------------------
+    # SUBIR FIXTURES
+    # ---------------------------
+    st.header("1. Cargar fixture (Football-Data)")
+
+    st.markdown(
+        """
+Sube el fichero `fixtures.xlsx` **tal cual** lo descargas de football-data.co.uk
+(sin tocar columnas ni nombre de hojas).
+        """
     )
 
-    if uploaded_file is None:
+    uploaded = st.file_uploader(
+        "Selecciona el fichero de fixtures",
+        type=["xlsx", "xls", "xlsm"],
+        key="fixtures_uploader",
+    )
+
+    if uploaded is None:
         st.info("Sube un fixture para continuar.")
         return
 
-    # --- Leer fixture subido ---
+    # ---------------------------
+    # LEER FIXTURE Y CLASIFICAR
+    # ---------------------------
     try:
-        fixtures_df = pd.read_excel(uploaded_file)
+        fixtures_df = pd.read_excel(uploaded)
     except Exception as e:
-        st.error(f"Error leyendo el fichero de fixtures: {e}")
+        st.error(f"Error leyendo el fichero: {e}")
         return
 
-    if fixtures_df.empty:
-        st.warning("El fixture está vacío o no se ha podido leer correctamente.")
-        return
+    # Normalizar nombres clave por si hubiera mayúsculas/minúsculas
+    fixtures_df.columns = [str(c).strip() for c in fixtures_df.columns]
 
-    st.success("Fixture cargado. Procesando partidos con el modelo...")
-
-    # --- Aplicar modelo y filtros (Ideal / Buena filtrada / etc.) ---
-    try:
-        scored = score_fixtures(
-            fixtures_df,
-            team_stats=team_stats,
-            div_stats=div_stats,
-            fav_threshold=2.0,       # min(B365H,B365A) ≥ 2.0
-            include_buena_filtrada=True,
+    required_cols = {"Div", "Date", "Time", "HomeTeam", "AwayTeam", "B365H", "B365D", "B365A"}
+    missing = required_cols - set(fixtures_df.columns)
+    if missing:
+        st.error(
+            "El fixtures no tiene las columnas mínimas necesarias:\n\n"
+            + ", ".join(sorted(missing))
         )
-    except TypeError:
-        # Por si tu model.score_fixtures no acepta todos los kwargs
-        scored = score_fixtures(fixtures_df, team_stats, div_stats)
-
-    if scored.empty:
-        st.warning("No se han podido puntuar los partidos del fixture.")
         return
 
-    # Esperamos estas columnas de salida desde score_fixtures:
-    # Div, Date, Time, HomeTeam, AwayTeam, B365H, B365D, B365A,
-    # L_score, LeagueTier, H_T_score, A_T_score, MatchScore, MatchClass, PickType
-    st.markdown("### 2. Resultados del modelo")
+    st.success(f"Fixture cargado: {len(fixtures_df)} partidos.")
 
-    # Vista que quiere ver el usuario
-    view = st.radio(
-        "¿Qué quieres ver?",
-        ("Solo partidos a apostar", "Todos los partidos puntuados"),
-        index=0,
-        horizontal=True,
-    )
+    # Clasificación con el modelo
+    with st.spinner("Clasificando partidos según el modelo..."):
+        scored = score_fixtures(hist, team_stats, div_stats, fixtures_df)
 
-    if "PickType" in scored.columns:
-        picks = scored[scored["PickType"].notna()].copy()
-    else:
-        picks = scored.iloc[0:0].copy()  # tabla vacía con mismas columnas
+    # Esperamos que score_fixtures devuelva al menos:
+    #  - L_score, LeagueTier
+    #  - H_T_score, A_T_score
+    #  - MatchScore, MatchClass
+    #  - FavOdd, NoClearFav
+    #  - IsBuenaFiltrada, PickType
 
-    if view == "Solo partidos a apostar":
-        df_show = picks
-        st.subheader("Partidos seleccionados (Ideal / Buena filtrada)")
-    else:
-        df_show = scored
-        st.subheader("Todos los partidos puntuados")
-
-    if df_show.empty:
-        st.info("No hay partidos que cumplan los criterios para hoy con el fixture subido.")
-        return
-
-    # Ordenar un poco
-    for col in ["Date", "Time"]:
-        if col in df_show.columns:
-            df_show[col] = pd.to_datetime(df_show[col], errors="coerce")
-
-    sort_cols = [c for c in ["Date", "Time", "Div", "HomeTeam"] if c in df_show.columns]
-    if sort_cols:
-        df_show = df_show.sort_values(sort_cols)
-
-    # Mostrar tabla
-    st.dataframe(
-        df_show,
-        use_container_width=True,
-    )
-
-    # Botón para descargar CSV
-    csv = df_show.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Descargar resultado en CSV",
-        data=csv,
-        file_name="partidos_clasificados.csv",
-        mime="text/csv",
-    )
+    st.header("2. Resultados del modelo")
 
     # Resumen rápido
-    if not picks.empty:
-        n_ideal = (picks["PickType"] == "Ideal").sum()
-        n_buena_f = (picks["PickType"] == "Buena filtrada").sum()
-        st.markdown(
-            f"**Resumen picks:** {len(picks)} partidos → "
-            f"{n_ideal} Ideal, {n_buena_f} Buena filtrada."
-        )
+    total = len(scored)
+    n_ideal = (scored["PickType"] == "Ideal").sum()
+    n_buena_f = (scored["PickType"] == "Buena filtrada").sum()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Partidos en el fixture", total)
+    with c2:
+        st.metric("Selecciones Ideal", n_ideal)
+    with c3:
+        st.metric("Selecciones Buena filtrada", n_buena_f)
+
+    st.markdown("### 2.1. Solo partidos seleccionados (Ideal / Buena filtrada)")
+
+    picks = scored[scored["PickType"].notna()].copy()
+    if picks.empty:
+        st.warning("Hoy no hay ningún partido que cumpla todos los filtros.")
+    else:
+        # Orden lógico por fecha/hora/liga
+        if "Date" in picks.columns:
+            # Si Date es texto, intentar parsear para ordenar bien
+            if not pd.api.types.is_datetime64_any_dtype(picks["Date"]):
+                picks["Date"] = pd.to_datetime(picks["Date"], errors="coerce")
+            picks = picks.sort_values(["Date", "Time", "Div", "HomeTeam"])
+
+        cols_to_show = [
+            "Date",
+            "Time",
+            "Div",
+            "HomeTeam",
+            "AwayTeam",
+            "B365H",
+            "B365D",
+            "B365A",
+            "L_score",
+            "LeagueTier",
+            "H_T_score",
+            "A_T_score",
+            "MatchScore",
+            "MatchClass",
+            "PickType",
+        ]
+        cols_to_show = [c for c in cols_to_show if c in picks.columns]
+
+        st.dataframe(picks[cols_to_show], use_container_width=True)
+
+    st.markdown("### 2.2. Tabla completa de partidos (diagnóstico)")
+
+    with st.expander("Ver todos los partidos del fixture con su puntuación", expanded=False):
+        st.dataframe(scored, use_container_width=True)
 
 
 if __name__ == "__main__":
