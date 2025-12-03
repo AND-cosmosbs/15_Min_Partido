@@ -1,45 +1,42 @@
+# app/main.py
+
 import os
 import sys
 from pathlib import Path
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
-# -------------------------------------------------------------------
-# CONFIGURAR RUTAS PARA PODER IMPORTAR backend.model
-# -------------------------------------------------------------------
-ROOT_DIR = Path(__file__).resolve().parent.parent  # carpeta raíz del repo
-if str(ROOT_DIR) not in sys.path:
-    sys.path.append(str(ROOT_DIR))
+# --- Añadir raíz del proyecto al PYTHONPATH ---
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 
-from backend.model import (
+from backend.model import (  # type: ignore
     load_historical_data,
     compute_team_and_league_stats,
     score_fixtures,
 )
 
-# -------------------------------------------------------------------
-# CACHÉ PARA HISTÓRICO Y STATS
-# -------------------------------------------------------------------
-@st.cache_data(show_spinner="Cargando histórico y estadísticas...")
+
+# ---------- CARGA HISTÓRICO (CACHEADO) ----------
+
+@st.cache_data(show_spinner="Cargando histórico y calculando estadísticas…")
 def _load_hist_and_stats():
-    # La carpeta 'data' está en la raíz del proyecto (al lado de app/, backend/, etc.)
-    data_dir = ROOT_DIR / "data"
-    hist = load_historical_data(data_dir)
+    hist = load_historical_data("data")
     team_stats, div_stats = compute_team_and_league_stats(hist)
     return hist, team_stats, div_stats
 
 
-# -------------------------------------------------------------------
-# INTERFAZ
-# -------------------------------------------------------------------
+# ---------- INTERFAZ PRINCIPAL ----------
+
 def main():
     st.set_page_config(
-        page_title="Selector de Partidos HT (modelo 0-0)",
+        page_title="Selector de Partidos HT/FT",
         layout="wide",
     )
 
-    st.title("Selector de partidos – Estrategia 0-0 HT / BTTS NO / Under 3.5 / 1-1")
+    st.title("Selector de partidos HT/FT – Modelo")
 
     # Cargar histórico + stats
     try:
@@ -47,63 +44,53 @@ def main():
         st.success("Histórico cargado correctamente.")
     except Exception as e:
         st.error(f"Error cargando histórico: {e}")
-        st.stop()
+        return
 
     st.markdown("### 1. Cargar fixture (Football-Data)")
-    st.write(
-        "Sube el fichero `fixtures.xlsx` tal cual lo descargas de football-data.co.uk."
-    )
 
     uploaded = st.file_uploader(
-        "Selecciona el fichero de fixtures",
-        type=["xlsx", "xlsm", "xls"],
+        "Sube el fichero `fixtures.xlsx` (tal cual de football-data.co.uk)",
+        type=["xlsx", "xls"],
     )
 
     if uploaded is None:
         st.info("Sube un fixture para continuar.")
         return
 
-    # ----------------------------------------------------------------
-    # LEER FIXTURE SUBIDO
-    # ----------------------------------------------------------------
+    # Leemos el fichero subido
     try:
-        fixtures_df = pd.read_excel(uploaded)
+        fixtures_raw = pd.read_excel(uploaded)
     except Exception as e:
-        st.error(f"No se ha podido leer el Excel subido: {e}")
+        st.error(f"Error leyendo el fichero de fixtures: {e}")
         return
 
-    # Normalizar nombres de columnas esperadas
-    expected_cols = ["Div", "Date", "Time", "HomeTeam", "AwayTeam", "B365H", "B365D", "B365A"]
-    missing = [c for c in expected_cols if c not in fixtures_df.columns]
+    # Nos quedamos con las columnas clave
+    expected_cols = ["Div", "Date", "Time", "HomeTeam", "AwayTeam",
+                     "B365H", "B365D", "B365A"]
+    missing = [c for c in expected_cols if c not in fixtures_raw.columns]
     if missing:
-        st.error(
-            "El fichero de fixtures no tiene las columnas esperadas.\n"
-            f"Faltan: {missing}"
-        )
+        st.error(f"Faltan columnas en el fixture: {missing}")
         return
 
-    # Convertir fecha y hora
-    fixtures_df["Date"] = pd.to_datetime(
-        fixtures_df["Date"], dayfirst=True, errors="coerce"
-    )
+    fixtures_df = fixtures_raw[expected_cols].copy()
 
-    # ----------------------------------------------------------------
-    # APLICAR MODELO
-    # score_fixtures(team_stats, div_stats, fixtures_df)
-    # ----------------------------------------------------------------
+    # ---------- Aplicar modelo ----------
     try:
         scored = score_fixtures(team_stats, div_stats, fixtures_df)
     except Exception as e:
         st.error(f"Error aplicando el modelo a los fixtures: {e}")
         return
 
-    # ----------------------------------------------------------------
-    # FILTRO Y SALIDA: solo columnas importantes
-    # ----------------------------------------------------------------
+    # Filtrar solo partidos con PickType (Ideal / Buena filtrada)
+    picks = scored[scored["PickType"].notna()].copy()
+
     st.markdown("### 2. Resultados del modelo")
 
-    # Si tu score_fixtures ya añade PickType / MatchClass / L_score, etc.,
-    # filtramos a lo relevante:
+    if picks.empty:
+        st.warning("Ningún partido cumple los filtros del modelo para este fixture.")
+        return
+
+    # Tabla reducida (lo que me pediste)
     cols_to_show = [
         "Date",
         "Time",
@@ -121,27 +108,13 @@ def main():
         "MatchClass",
         "PickType",
     ]
-    cols_present = [c for c in cols_to_show if c in scored.columns]
 
-    if not cols_present:
-        st.error(
-            "El DataFrame resultante no contiene las columnas esperadas "
-            "(L_score, H_T_score, A_T_score, MatchScore, MatchClass, PickType...)."
-        )
-        st.dataframe(scored)
-        return
+    table = picks[cols_to_show].sort_values(["Date", "Time", "Div", "HomeTeam"])
 
-    # Ordenar por fecha/hora
-    if "Date" in scored.columns and "Time" in scored.columns:
-        scored = scored.sort_values(["Date", "Time", "Div", "HomeTeam"])
-
-    # Mostrar tabla filtrada
-    st.dataframe(scored[cols_present], use_container_width=True)
-
-    # Un pequeño resumen por tipo de pick
-    if "PickType" in scored.columns:
-        st.markdown("#### Resumen por tipo de pick")
-        st.write(scored["PickType"].value_counts())
+    st.dataframe(
+        table,
+        use_container_width=True,
+    )
 
 
 if __name__ == "__main__":
