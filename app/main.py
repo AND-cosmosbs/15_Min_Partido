@@ -2,7 +2,6 @@
 
 import os
 import sys
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -17,6 +16,7 @@ from backend.model import (  # type: ignore
     compute_team_and_league_stats,
     score_fixtures,
 )
+from backend.seguimiento import insert_seguimiento_from_picks  # type: ignore
 
 
 # ---------- CARGA HISTÓRICO (CACHEADO) ----------
@@ -90,7 +90,7 @@ def main():
         st.warning("Ningún partido cumple los filtros del modelo para este fixture.")
         return
 
-    # Tabla reducida (lo que me pediste)
+    # Tabla reducida
     cols_to_show = [
         "Date",
         "Time",
@@ -109,12 +109,74 @@ def main():
         "PickType",
     ]
 
-    table = picks[cols_to_show].sort_values(["Date", "Time", "Div", "HomeTeam"])
-
-    st.dataframe(
-        table,
-        use_container_width=True,
+    base_table = (
+        picks[cols_to_show]
+        .sort_values(["Date", "Time", "Div", "HomeTeam"])
+        .copy()
     )
+
+    # Añadimos columna de selección
+    base_table["Seleccionar"] = False
+
+    st.markdown("#### Selecciona los partidos a los que vas a apostar")
+
+    edited = st.data_editor(
+        base_table,
+        use_container_width=True,
+        key="tabla_picks_con_seleccion",
+        column_config={
+            "Seleccionar": st.column_config.CheckboxColumn(
+                "Seleccionar",
+                help="Marca los partidos a los que realmente vas a apostar",
+                default=False,
+            )
+        },
+    )
+
+    # Filtrar los seleccionados
+    seleccionados = edited[edited["Seleccionar"] == True].copy()
+
+    st.markdown("### 3. Guardar selección en Supabase")
+
+    col1, col2 = st.columns([1, 3])
+
+    with col1:
+        st.write(f"Partidos seleccionados: **{len(seleccionados)}**")
+
+    guardar = st.button("Guardar seleccionados en Supabase")
+
+    if guardar:
+        if seleccionados.empty:
+            st.warning("No has seleccionado ningún partido.")
+        else:
+            try:
+                # Eliminamos la columna Seleccionar antes de mergear
+                seleccionados_sin_flag = seleccionados.drop(columns=["Seleccionar"])
+
+                merge_cols = [
+                    "Date",
+                    "Time",
+                    "Div",
+                    "HomeTeam",
+                    "AwayTeam",
+                    "B365H",
+                    "B365D",
+                    "B365A",
+                ]
+
+                # Volvemos a unir con 'picks' para incluir L_score, H_T_score, etc.
+                seleccionados_full = seleccionados_sin_flag.merge(
+                    picks,
+                    on=merge_cols,
+                    how="left",
+                    suffixes=("", "_y"),
+                )
+
+                insert_seguimiento_from_picks(seleccionados_full)
+
+                st.success("Partidos guardados en la tabla 'seguimiento' de Supabase.")
+            except Exception as e:
+                st.error(f"Error guardando en Supabase: {e}")
 
 
 if __name__ == "__main__":
