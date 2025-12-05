@@ -25,7 +25,6 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
     for _, r in picks_df.iterrows():
         fecha = None
         if "Date" in r and pd.notna(r["Date"]):
-            # r["Date"] suele ser un Timestamp
             try:
                 fecha = r["Date"].date()
             except Exception:
@@ -50,20 +49,12 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
             "match_score": int(r["MatchScore"]) if pd.notna(r.get("MatchScore")) else None,
             "match_class": r.get("MatchClass"),
             "pick_type": r.get("PickType"),
-            # El resto de columnas de la tabla 'seguimiento' se dejan a NULL:
-            # stake_btts_no, stake_u35, stake_1_1,
-            # close_minute_global, close_minute_1_1,
-            # odds_btts_no_init, odds_u35_init, odds_1_1_init,
-            # profit_euros, roi
         }
 
         records.append(rec)
 
-    # Inserción en Supabase
-    # Si quieres controlar errores más fino, puedes inspeccionar resp.error
     resp = supabase.table("seguimiento").insert(records).execute()
 
-    # resp.data contiene las filas insertadas (si todo va bien)
-    # resp.error, si existe, indicaría error
+    # Manejo simple de error
     if getattr(resp, "error", None):
-        raise RuntimeError(f"Error insertando en seguimiento: {resp.error}")lo 
+        raise RuntimeError(f"Error insertando en seguimiento: {resp.error}")
