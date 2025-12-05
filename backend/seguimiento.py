@@ -6,6 +6,16 @@ import pandas as pd
 from .supabase_client import supabase
 
 
+def _to_int_or_none(value):
+    """Convierte a int o devuelve None si no se puede."""
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
 def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
     """
     Inserta en la tabla 'seguimiento' las filas de picks_df.
@@ -36,6 +46,12 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
         if "Time" in r and pd.notna(r["Time"]):
             hora = str(r["Time"])
 
+        # Campos INT: los forzamos a int o None
+        l_score = _to_int_or_none(r.get("L_score"))
+        h_t_score = _to_int_or_none(r.get("H_T_score"))
+        a_t_score = _to_int_or_none(r.get("A_T_score"))
+        match_score = _to_int_or_none(r.get("MatchScore"))
+
         # ----- Registro final -----
         rec: Dict = {
             "fecha": fecha_str,
@@ -49,13 +65,11 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
             "b365d": r.get("B365D"),
             "b365a": r.get("B365A"),
 
-            # Scores del modelo
-            "l_score": r.get("L_score"),
-            "h_t_score": r.get("H_T_score"),
-            "a_t_score": r.get("A_T_score"),
-
-            # match_score puede venir como float → convertimos si aplica
-            "match_score": int(r["MatchScore"]) if pd.notna(r.get("MatchScore")) else None,
+            # Scores del modelo (INT en la BD)
+            "l_score": l_score,
+            "h_t_score": h_t_score,
+            "a_t_score": a_t_score,
+            "match_score": match_score,
 
             "match_class": r.get("MatchClass"),
             "pick_type": r.get("PickType"),
@@ -68,6 +82,5 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
     # ----- Inserción en Supabase -----
     resp = supabase.table("seguimiento").insert(records).execute()
 
-    # Si Supabase devuelve error, lo mostramos
     if getattr(resp, "error", None):
         raise RuntimeError(f"Error insertando en seguimiento: {resp.error}")
