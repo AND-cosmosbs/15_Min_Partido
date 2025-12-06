@@ -20,6 +20,7 @@ from backend.seguimiento import (  # type: ignore
     insert_seguimiento_from_picks,
     fetch_seguimiento,
     update_seguimiento_from_df,
+    update_seguimiento_row,
 )
 
 
@@ -229,6 +230,34 @@ def show_gestion():
         else:
             div_filter = []
 
+        # Filtro por equipo (aparece como local o visitante)
+        equipos = sorted(
+            set(df.get("home_team", pd.Series()).dropna().unique())
+            | set(df.get("away_team", pd.Series()).dropna().unique())
+        )
+        if equipos:
+            equipos_filter = st.multiselect(
+                "Filtrar por equipo (local o visitante)",
+                options=equipos,
+                default=[],
+            )
+        else:
+            equipos_filter = []
+
+        # Opcional: filtro por apuesta_real
+        if "apuesta_real" in df.columns:
+            ar_values = sorted([x for x in df["apuesta_real"].dropna().unique()])
+            if ar_values:
+                apuesta_real_filter = st.multiselect(
+                    "Filtrar por apuesta_real (SI/NO)",
+                    options=ar_values,
+                    default=ar_values,
+                )
+            else:
+                apuesta_real_filter = []
+        else:
+            apuesta_real_filter = []
+
     # Aplicar filtros
     mask = pd.Series(True, index=df.index)
 
@@ -242,6 +271,12 @@ def show_gestion():
     if div_filter:
         mask &= df["division"].isin(div_filter)
 
+    if equipos_filter:
+        mask &= df["home_team"].isin(equipos_filter) | df["away_team"].isin(equipos_filter)
+
+    if apuesta_real_filter and "apuesta_real" in df.columns:
+        mask &= df["apuesta_real"].isin(apuesta_real_filter)
+
     filtered = df[mask].copy()
 
     if filtered.empty:
@@ -250,7 +285,7 @@ def show_gestion():
 
     st.write(f"Registros filtrados: **{len(filtered)}**")
 
-    # Columnas editables
+    # Columnas editables (incluimos apuesta_real)
     editable_cols = [
         "stake_btts_no",
         "stake_u35",
@@ -262,13 +297,16 @@ def show_gestion():
         "odds_1_1_init",
         "profit_euros",
         "roi",
+        "apuesta_real",
     ]
 
     # Ordenamos por fecha/hora para que sea más legible
     if "fecha" in filtered.columns:
         filtered = filtered.sort_values(["fecha", "hora", "division", "home_team"])
 
-    # Mostramos editor
+    # Mostramos editor tipo tabla para edición masiva
+    st.markdown("#### Edición rápida (tabla)")
+
     edited = st.data_editor(
         filtered,
         use_container_width=True,
@@ -276,7 +314,7 @@ def show_gestion():
         hide_index=True,
     )
 
-    if st.button("Guardar cambios en Supabase"):
+    if st.button("Guardar cambios en Supabase (tabla)"):
         try:
             updated = update_seguimiento_from_df(
                 original_df=filtered,
@@ -286,6 +324,128 @@ def show_gestion():
             st.success(f"Se han actualizado {updated} filas en la tabla 'seguimiento'.")
         except Exception as e:
             st.error(f"Error actualizando en Supabase: {e}")
+
+    st.markdown("---")
+    st.markdown("#### Edición detallada (modo formulario)")
+
+    if "id" not in filtered.columns:
+        st.warning("No hay columna 'id' en los datos, no se puede usar el modo formulario.")
+        return
+
+    # Construimos opciones legibles para seleccionar registro
+    opciones = []
+    for _, row in filtered.iterrows():
+        etiqueta = (
+            f"ID {row['id']} - {row.get('fecha', '')} - {row.get('division', '')} - "
+            f"{row.get('home_team', '')} vs {row.get('away_team', '')}"
+        )
+        opciones.append((int(row["id"]), etiqueta))
+
+    if not opciones:
+        st.info("No hay registros para mostrar en formulario.")
+        return
+
+    ids = [o[0] for o in opciones]
+    labels = [o[1] for o in opciones]
+
+    seleccion = st.selectbox(
+        "Selecciona una apuesta para editar en detalle",
+        options=list(range(len(ids))),
+        format_func=lambda i: labels[i],
+    )
+
+    selected_id = ids[seleccion]
+    row_sel = filtered[filtered["id"] == selected_id].iloc[0]
+
+    with st.form("form_edicion_detallada"):
+        st.write(
+            f"**Partido:** {row_sel.get('home_team', '')} vs {row_sel.get('away_team', '')} "
+            f"({row_sel.get('division', '')}, {row_sel.get('fecha', '')}, {row_sel.get('hora', '')})"
+        )
+
+        stake_btts_no = st.number_input(
+            "Stake BTTS NO",
+            value=float(row_sel["stake_btts_no"]) if pd.notna(row_sel.get("stake_btts_no")) else 0.0,
+            step=1.0,
+        )
+        stake_u35 = st.number_input(
+            "Stake Under 3.5",
+            value=float(row_sel["stake_u35"]) if pd.notna(row_sel.get("stake_u35")) else 0.0,
+            step=1.0,
+        )
+        stake_1_1 = st.number_input(
+            "Stake marcador 1-1",
+            value=float(row_sel["stake_1_1"]) if pd.notna(row_sel.get("stake_1_1")) else 0.0,
+            step=1.0,
+        )
+
+        close_minute_global = st.number_input(
+            "Minuto de cierre global",
+            value=int(row_sel["close_minute_global"]) if pd.notna(row_sel.get("close_minute_global")) else 0,
+            step=1,
+        )
+        close_minute_1_1 = st.number_input(
+            "Minuto de cierre 1-1",
+            value=int(row_sel["close_minute_1_1"]) if pd.notna(row_sel.get("close_minute_1_1")) else 0,
+            step=1,
+        )
+
+        odds_btts_no_init = st.number_input(
+            "Cuota inicial BTTS NO",
+            value=float(row_sel["odds_btts_no_init"]) if pd.notna(row_sel.get("odds_btts_no_init")) else 0.0,
+            step=0.01,
+        )
+        odds_u35_init = st.number_input(
+            "Cuota inicial Under 3.5",
+            value=float(row_sel["odds_u35_init"]) if pd.notna(row_sel.get("odds_u35_init")) else 0.0,
+            step=0.01,
+        )
+        odds_1_1_init = st.number_input(
+            "Cuota inicial 1-1",
+            value=float(row_sel["odds_1_1_init"]) if pd.notna(row_sel.get("odds_1_1_init")) else 0.0,
+            step=0.01,
+        )
+
+        profit_euros = st.number_input(
+            "Profit (€)",
+            value=float(row_sel["profit_euros"]) if pd.notna(row_sel.get("profit_euros")) else 0.0,
+            step=1.0,
+        )
+        roi = st.number_input(
+            "ROI (%)",
+            value=float(row_sel["roi"]) if pd.notna(row_sel.get("roi")) else 0.0,
+            step=0.1,
+        )
+
+        apuesta_real_actual = row_sel.get("apuesta_real") or "NO"
+        apuesta_real = st.selectbox(
+            "¿Apuesta real?",
+            options=["SI", "NO"],
+            index=0 if apuesta_real_actual == "SI" else 1,
+        )
+
+        submitted = st.form_submit_button("Guardar cambios (formulario)")
+
+        if submitted:
+            cambios = {
+                "stake_btts_no": stake_btts_no,
+                "stake_u35": stake_u35,
+                "stake_1_1": stake_1_1,
+                "close_minute_global": close_minute_global,
+                "close_minute_1_1": close_minute_1_1,
+                "odds_btts_no_init": odds_btts_no_init,
+                "odds_u35_init": odds_u35_init,
+                "odds_1_1_init": odds_1_1_init,
+                "profit_euros": profit_euros,
+                "roi": roi,
+                "apuesta_real": apuesta_real,
+            }
+
+            try:
+                update_seguimiento_row(selected_id, cambios)
+                st.success(f"Registro ID {selected_id} actualizado correctamente.")
+            except Exception as e:
+                st.error(f"Error actualizando (formulario) en Supabase: {e}")
 
 
 # ---------- INTERFAZ PRINCIPAL ----------
