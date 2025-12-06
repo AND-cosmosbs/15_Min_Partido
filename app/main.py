@@ -16,7 +16,11 @@ from backend.model import (  # type: ignore
     compute_team_and_league_stats,
     score_fixtures,
 )
-from backend.seguimiento import insert_seguimiento_from_picks  # type: ignore
+from backend.seguimiento import (  # type: ignore
+    insert_seguimiento_from_picks,
+    fetch_seguimiento,
+    update_seguimiento_from_df,
+)
 
 
 # ---------- CARGA HISTÓRICO (CACHEADO) ----------
@@ -28,24 +32,9 @@ def _load_hist_and_stats():
     return hist, team_stats, div_stats
 
 
-# ---------- INTERFAZ PRINCIPAL ----------
+# ---------- VISTA: SELECTOR DE PARTIDOS ----------
 
-def main():
-    st.set_page_config(
-        page_title="Selector de Partidos HT/FT",
-        layout="wide",
-    )
-
-    st.title("Selector de partidos HT/FT – Modelo")
-
-    # Cargar histórico + stats
-    try:
-        hist, team_stats, div_stats = _load_hist_and_stats()
-        st.success("Histórico cargado correctamente.")
-    except Exception as e:
-        st.error(f"Error cargando histórico: {e}")
-        return
-
+def show_selector():
     st.markdown("### 1. Cargar fixture (Football-Data)")
 
     uploaded = st.file_uploader(
@@ -73,6 +62,13 @@ def main():
         return
 
     fixtures_df = fixtures_raw[expected_cols].copy()
+
+    # Cargar histórico + stats para el modelo
+    try:
+        _, team_stats, div_stats = _load_hist_and_stats()
+    except Exception as e:
+        st.error(f"Error cargando histórico/modelo: {e}")
+        return
 
     # ---------- Aplicar modelo ----------
     try:
@@ -177,6 +173,141 @@ def main():
                 st.success("Partidos guardados en la tabla 'seguimiento' de Supabase.")
             except Exception as e:
                 st.error(f"Error guardando en Supabase: {e}")
+
+
+# ---------- VISTA: GESTIÓN DE APUESTAS ----------
+
+def show_gestion():
+    st.markdown("### Gestión de apuestas guardadas (`seguimiento`)")
+
+    try:
+        df = fetch_seguimiento()
+    except Exception as e:
+        st.error(f"Error cargando datos de seguimiento: {e}")
+        return
+
+    if df.empty:
+        st.info("Todavía no hay apuestas guardadas en la tabla 'seguimiento'.")
+        return
+
+    # Normalizamos fecha para filtrar
+    if "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+
+    # Filtros
+    with st.expander("Filtros"):
+        # Rango de fechas
+        if "fecha" in df.columns and df["fecha"].notna().any():
+            min_date = df["fecha"].min().date()
+            max_date = df["fecha"].max().date()
+            fecha_desde, fecha_hasta = st.date_input(
+                "Rango de fechas",
+                value=(min_date, max_date),
+            )
+        else:
+            fecha_desde, fecha_hasta = None, None
+
+        # Filtro por pick_type
+        pick_types = sorted([x for x in df.get("pick_type", pd.Series()).dropna().unique()])
+        if pick_types:
+            pick_filter = st.multiselect(
+                "Filtrar por PickType",
+                options=pick_types,
+                default=pick_types,
+            )
+        else:
+            pick_filter = []
+
+        # Filtro por division
+        divisiones = sorted([x for x in df.get("division", pd.Series()).dropna().unique()])
+        if divisiones:
+            div_filter = st.multiselect(
+                "Filtrar por división",
+                options=divisiones,
+                default=divisiones,
+            )
+        else:
+            div_filter = []
+
+    # Aplicar filtros
+    mask = pd.Series(True, index=df.index)
+
+    if fecha_desde is not None and "fecha" in df.columns:
+        mask &= df["fecha"].dt.date >= fecha_desde
+    if fecha_hasta is not None and "fecha" in df.columns:
+        mask &= df["fecha"].dt.date <= fecha_hasta
+
+    if pick_filter:
+        mask &= df["pick_type"].isin(pick_filter)
+    if div_filter:
+        mask &= df["division"].isin(div_filter)
+
+    filtered = df[mask].copy()
+
+    if filtered.empty:
+        st.warning("No hay registros que cumplan los filtros.")
+        return
+
+    st.write(f"Registros filtrados: **{len(filtered)}**")
+
+    # Columnas editables
+    editable_cols = [
+        "stake_btts_no",
+        "stake_u35",
+        "stake_1_1",
+        "close_minute_global",
+        "close_minute_1_1",
+        "odds_btts_no_init",
+        "odds_u35_init",
+        "odds_1_1_init",
+        "profit_euros",
+        "roi",
+    ]
+
+    # Ordenamos por fecha/hora para que sea más legible
+    if "fecha" in filtered.columns:
+        filtered = filtered.sort_values(["fecha", "hora", "division", "home_team"])
+
+    # Mostramos editor
+    edited = st.data_editor(
+        filtered,
+        use_container_width=True,
+        key="editor_seguimiento",
+        hide_index=True,
+    )
+
+    if st.button("Guardar cambios en Supabase"):
+        try:
+            updated = update_seguimiento_from_df(
+                original_df=filtered,
+                edited_df=edited,
+                editable_cols=editable_cols,
+            )
+            st.success(f"Se han actualizado {updated} filas en la tabla 'seguimiento'.")
+        except Exception as e:
+            st.error(f"Error actualizando en Supabase: {e}")
+
+
+# ---------- INTERFAZ PRINCIPAL ----------
+
+def main():
+    st.set_page_config(
+        page_title="Selector de Partidos HT/FT",
+        layout="wide",
+    )
+
+    st.sidebar.title("Navegación")
+    modo = st.sidebar.radio(
+        "Selecciona modo",
+        options=["Selector de partidos", "Gestión de apuestas"],
+    )
+
+    if modo == "Selector de partidos":
+        st.title("Selector de partidos HT/FT – Modelo")
+        show_selector()
+    else:
+        st.title("Gestión de apuestas – Seguimiento")
+        show_gestion()
 
 
 if __name__ == "__main__":
