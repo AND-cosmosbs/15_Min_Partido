@@ -85,6 +85,9 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
 
             # Campo 'model_class' (NOT NULL en tu BD)
             "model_class": match_class,
+
+            # Nueva columna: apuesta_real (por defecto NO al registrar desde el modelo)
+            "apuesta_real": "NO",
         }
 
         records.append(rec)
@@ -180,3 +183,17 @@ def update_seguimiento_from_df(
         updated_rows += 1
 
     return updated_rows
+
+
+def update_seguimiento_row(row_id: int, changes: Dict) -> None:
+    """
+    Actualiza una sola fila de 'seguimiento' por id, con los campos dados en changes.
+    """
+    # Normalizamos los campos que deben ser INT
+    for minute_col in ["close_minute_global", "close_minute_1_1"]:
+        if minute_col in changes:
+            changes[minute_col] = _to_int_or_none(changes[minute_col])
+
+    resp = supabase.table("seguimiento").update(changes).eq("id", int(row_id)).execute()
+    if getattr(resp, "error", None):
+        raise RuntimeError(f"Error actualizando id={row_id} en seguimiento: {resp.error}")
