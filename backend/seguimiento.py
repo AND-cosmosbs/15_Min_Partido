@@ -52,6 +52,9 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
         a_t_score = _to_int_or_none(r.get("A_T_score"))
         match_score = _to_int_or_none(r.get("MatchScore"))
 
+        match_class = r.get("MatchClass")
+        pick_type = r.get("PickType")
+
         # ----- Registro final -----
         rec: Dict = {
             "fecha": fecha_str,
@@ -76,8 +79,12 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
             "a_t_score": a_t_score,
             "match_score": match_score,
 
-            "match_class": r.get("MatchClass"),
-            "pick_type": r.get("PickType"),
+            # Clasificación del modelo
+            "match_class": match_class,
+            "pick_type": pick_type,
+
+            # Campo 'model_class' (NOT NULL en tu BD)
+            "model_class": match_class,
 
             # El resto (stakes, odds reales, profit...) queda en NULL
         }
