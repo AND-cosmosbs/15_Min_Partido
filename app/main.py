@@ -244,7 +244,7 @@ def show_gestion():
         else:
             equipos_filter = []
 
-        # Opcional: filtro por apuesta_real
+        # Filtro por apuesta_real
         if "apuesta_real" in df.columns:
             ar_values = sorted([x for x in df["apuesta_real"].dropna().unique()])
             if ar_values:
@@ -285,7 +285,7 @@ def show_gestion():
 
     st.write(f"Registros filtrados: **{len(filtered)}**")
 
-    # Columnas editables (incluimos apuesta_real)
+    # Columnas editables (incluimos apuesta_real; ROI aquí sigue siendo editable en modo tabla)
     editable_cols = [
         "stake_btts_no",
         "stake_u35",
@@ -411,11 +411,17 @@ def show_gestion():
             value=float(row_sel["profit_euros"]) if pd.notna(row_sel.get("profit_euros")) else 0.0,
             step=1.0,
         )
-        roi = st.number_input(
-            "ROI (%)",
-            value=float(row_sel["roi"]) if pd.notna(row_sel.get("roi")) else 0.0,
-            step=0.1,
-        )
+
+        # ROI calculado automáticamente: profit / suma(stakes)
+        total_stakes = stake_btts_no + stake_u35 + stake_1_1
+        roi_calculado = None
+        if total_stakes > 0:
+            roi_calculado = profit_euros / total_stakes
+
+        if roi_calculado is not None:
+            st.write(f"ROI (calculado = profit / suma stakes): **{roi_calculado:.4f}**")
+        else:
+            st.write("ROI (calculado): _sin valor (faltan stakes)_")
 
         apuesta_real_actual = row_sel.get("apuesta_real") or "NO"
         apuesta_real = st.selectbox(
@@ -437,7 +443,8 @@ def show_gestion():
                 "odds_u35_init": odds_u35_init,
                 "odds_1_1_init": odds_1_1_init,
                 "profit_euros": profit_euros,
-                "roi": roi,
+                # ROI se guarda calculado (o None si no hay stakes)
+                "roi": roi_calculado,
                 "apuesta_real": apuesta_real,
             }
 
