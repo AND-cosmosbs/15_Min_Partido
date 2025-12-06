@@ -56,7 +56,12 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
         rec: Dict = {
             "fecha": fecha_str,
             "hora": hora,
+
+            # OJO: en tu BD hay 'division' y también 'div' (NOT NULL).
+            # Rellenamos ambas con el mismo valor del campo Div de Football-Data.
             "division": r.get("Div"),
+            "div": r.get("Div"),
+
             "home_team": r.get("HomeTeam"),
             "away_team": r.get("AwayTeam"),
 
