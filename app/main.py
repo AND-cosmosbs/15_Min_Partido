@@ -285,7 +285,7 @@ def show_gestion():
 
     st.write(f"Registros filtrados: **{len(filtered)}**")
 
-    # Columnas editables (incluimos apuesta_real; ROI aquí sigue siendo editable en modo tabla)
+    # Columnas editables (OJO: ROI NO se edita en tabla, solo en formulario)
     editable_cols = [
         "stake_btts_no",
         "stake_u35",
@@ -296,7 +296,6 @@ def show_gestion():
         "odds_u35_init",
         "odds_1_1_init",
         "profit_euros",
-        "roi",
         "apuesta_real",
     ]
 
@@ -412,16 +411,14 @@ def show_gestion():
             step=1.0,
         )
 
-        # ROI calculado automáticamente: profit / suma(stakes)
-        total_stakes = stake_btts_no + stake_u35 + stake_1_1
-        roi_calculado = None
-        if total_stakes > 0:
-            roi_calculado = profit_euros / total_stakes
-
-        if roi_calculado is not None:
-            st.write(f"ROI (calculado = profit / suma stakes): **{roi_calculado:.4f}**")
+        # ROI calculado automáticamente = profit / suma stakes
+        total_stake = stake_btts_no + stake_u35 + stake_1_1
+        if total_stake > 0 and profit_euros is not None:
+            form_roi = profit_euros / total_stake
+            st.write(f"ROI (profit / suma stakes): **{form_roi:.3f}**")
         else:
-            st.write("ROI (calculado): _sin valor (faltan stakes)_")
+            form_roi = None
+            st.write("ROI: — (no calculable, faltan stakes o profit)")
 
         apuesta_real_actual = row_sel.get("apuesta_real") or "NO"
         apuesta_real = st.selectbox(
@@ -443,10 +440,14 @@ def show_gestion():
                 "odds_u35_init": odds_u35_init,
                 "odds_1_1_init": odds_1_1_init,
                 "profit_euros": profit_euros,
-                # ROI se guarda calculado (o None si no hay stakes)
-                "roi": roi_calculado,
                 "apuesta_real": apuesta_real,
             }
+
+            # Solo mandamos ROI si es calculable
+            if form_roi is not None:
+                cambios["roi"] = form_roi
+            else:
+                cambios["roi"] = None
 
             try:
                 update_seguimiento_row(selected_id, cambios)
@@ -479,3 +480,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
