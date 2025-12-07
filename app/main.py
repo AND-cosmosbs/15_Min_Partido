@@ -33,7 +33,9 @@ def _load_hist_and_stats():
     return hist, team_stats, div_stats
 
 
-# ---------- VISTA: SELECTOR DE PARTIDOS ----------
+# ======================================================================
+# VISTA: SELECTOR DE PARTIDOS
+# ======================================================================
 
 def show_selector():
     st.markdown("### 1. Cargar fixture (Football-Data)")
@@ -176,7 +178,9 @@ def show_selector():
                 st.error(f"Error guardando en Supabase: {e}")
 
 
-# ---------- VISTA: GESTIÓN DE APUESTAS ----------
+# ======================================================================
+# VISTA: GESTIÓN DE APUESTAS
+# ======================================================================
 
 def show_gestion():
     st.markdown("### Gestión de apuestas guardadas (`seguimiento`)")
@@ -195,7 +199,7 @@ def show_gestion():
     if "fecha" in df.columns:
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
 
-    # Filtros
+    # ----------------- FILTROS -----------------
     with st.expander("Filtros"):
         # Rango de fechas
         if "fecha" in df.columns and df["fecha"].notna().any():
@@ -285,7 +289,7 @@ def show_gestion():
 
     st.write(f"Registros filtrados: **{len(filtered)}**")
 
-    # Columnas editables (OJO: ROI NO se edita en tabla, solo en formulario)
+    # Columnas editables (incluimos apuesta_real)
     editable_cols = [
         "stake_btts_no",
         "stake_u35",
@@ -296,6 +300,7 @@ def show_gestion():
         "odds_u35_init",
         "odds_1_1_init",
         "profit_euros",
+        "roi",
         "apuesta_real",
     ]
 
@@ -303,7 +308,7 @@ def show_gestion():
     if "fecha" in filtered.columns:
         filtered = filtered.sort_values(["fecha", "hora", "division", "home_team"])
 
-    # Mostramos editor tipo tabla para edición masiva
+    # ----------------- EDICIÓN RÁPIDA (TABLA) -----------------
     st.markdown("#### Edición rápida (tabla)")
 
     edited = st.data_editor(
@@ -324,6 +329,7 @@ def show_gestion():
         except Exception as e:
             st.error(f"Error actualizando en Supabase: {e}")
 
+    # ----------------- EDICIÓN DETALLADA (FORMULARIO) -----------------
     st.markdown("---")
     st.markdown("#### Edición detallada (modo formulario)")
 
@@ -411,14 +417,14 @@ def show_gestion():
             step=1.0,
         )
 
-        # ROI calculado automáticamente = profit / suma stakes
+        # ROI calculado automáticamente: profit / suma de stakes
         total_stake = stake_btts_no + stake_u35 + stake_1_1
-        if total_stake > 0 and profit_euros is not None:
-            form_roi = profit_euros / total_stake
-            st.write(f"ROI (profit / suma stakes): **{form_roi:.3f}**")
+        if total_stake > 0:
+            roi_calc = profit_euros / total_stake
+            st.write(f"ROI calculado: **{roi_calc:.3f}** (profit / suma de stakes)")
         else:
-            form_roi = None
-            st.write("ROI: — (no calculable, faltan stakes o profit)")
+            roi_calc = None
+            st.write("ROI calculado: — (faltan stakes o profit)")
 
         apuesta_real_actual = row_sel.get("apuesta_real") or "NO"
         apuesta_real = st.selectbox(
@@ -443,9 +449,9 @@ def show_gestion():
                 "apuesta_real": apuesta_real,
             }
 
-            # Solo mandamos ROI si es calculable
-            if form_roi is not None:
-                cambios["roi"] = form_roi
+            # Solo enviamos ROI si se ha podido calcular
+            if roi_calc is not None:
+                cambios["roi"] = roi_calc
             else:
                 cambios["roi"] = None
 
@@ -456,7 +462,183 @@ def show_gestion():
                 st.error(f"Error actualizando (formulario) en Supabase: {e}")
 
 
-# ---------- INTERFAZ PRINCIPAL ----------
+# ======================================================================
+# VISTA: ESTADÍSTICAS ROI
+# ======================================================================
+
+def show_stats():
+    st.markdown("### Estadísticas de ROI")
+
+    try:
+        df = fetch_seguimiento()
+    except Exception as e:
+        st.error(f"Error cargando datos de seguimiento: {e}")
+        return
+
+    if df.empty:
+        st.info("Todavía no hay apuestas en la tabla 'seguimiento'.")
+        return
+
+    # Normalizamos fecha
+    if "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+
+    # Calculamos total_stake y roi_calculado (independiente del campo roi guardado)
+    for col in ["stake_btts_no", "stake_u35", "stake_1_1", "profit_euros"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["total_stake"] = (
+        df.get("stake_btts_no", 0).fillna(0)
+        + df.get("stake_u35", 0).fillna(0)
+        + df.get("stake_1_1", 0).fillna(0)
+    )
+
+    df["roi_calc"] = None
+    mask_valid = (df["total_stake"] > 0) & df["profit_euros"].notna()
+    df.loc[mask_valid, "roi_calc"] = df.loc[mask_valid, "profit_euros"] / df.loc[mask_valid, "total_stake"]
+
+    # Filtro por apuesta_real (para separar reales de simuladas)
+    apuesta_real_opts = sorted([x for x in df.get("apuesta_real", pd.Series()).dropna().unique()])
+    if apuesta_real_opts:
+        ar_sel = st.multiselect(
+            "Filtrar por tipo de apuesta",
+            options=apuesta_real_opts,
+            default=apuesta_real_opts,
+        )
+        df = df[df["apuesta_real"].isin(ar_sel)]
+
+    if df.empty:
+        st.warning("No hay registros tras aplicar el filtro de apuesta_real.")
+        return
+
+    # ----------------- TABLAS DE ROI -----------------
+
+    # ROI global
+    total_profit = df["profit_euros"].fillna(0).sum()
+    total_stake_sum = df["total_stake"].fillna(0).sum()
+    roi_global = total_profit / total_stake_sum if total_stake_sum > 0 else None
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total profit (€)", f"{total_profit:,.2f}")
+    with col2:
+        st.metric("Total stake (€)", f"{total_stake_sum:,.2f}")
+    with col3:
+        if roi_global is not None:
+            st.metric("ROI global", f"{roi_global:.3f}")
+        else:
+            st.metric("ROI global", "—")
+
+    st.markdown("#### ROI por tipo de apuesta (apuesta_real)")
+
+    if "apuesta_real" in df.columns:
+        grp_ar = (
+            df.groupby("apuesta_real")
+            .apply(lambda g: pd.Series({
+                "profit_total": g["profit_euros"].fillna(0).sum(),
+                "stake_total": g["total_stake"].fillna(0).sum(),
+            }))
+            .reset_index()
+        )
+        grp_ar["roi"] = grp_ar.apply(
+            lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else None,
+            axis=1,
+        )
+        st.dataframe(grp_ar, use_container_width=True)
+    else:
+        st.write("No existe columna 'apuesta_real' en los datos.")
+
+    st.markdown("#### ROI por división")
+
+    if "division" in df.columns:
+        grp_div = (
+            df.groupby("division")
+            .apply(lambda g: pd.Series({
+                "profit_total": g["profit_euros"].fillna(0).sum(),
+                "stake_total": g["total_stake"].fillna(0).sum(),
+                "n_apuestas": len(g),
+            }))
+            .reset_index()
+        )
+        grp_div["roi"] = grp_div.apply(
+            lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else None,
+            axis=1,
+        )
+        st.dataframe(grp_div.sort_values("roi", ascending=False), use_container_width=True)
+    else:
+        st.write("No existe columna 'division' en los datos.")
+
+    st.markdown("#### ROI por PickType")
+
+    if "pick_type" in df.columns:
+        grp_pick = (
+            df.groupby("pick_type")
+            .apply(lambda g: pd.Series({
+                "profit_total": g["profit_euros"].fillna(0).sum(),
+                "stake_total": g["total_stake"].fillna(0).sum(),
+                "n_apuestas": len(g),
+            }))
+            .reset_index()
+        )
+        grp_pick["roi"] = grp_pick.apply(
+            lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else None,
+            axis=1,
+        )
+        st.dataframe(grp_pick.sort_values("roi", ascending=False), use_container_width=True)
+    else:
+        st.write("No existe columna 'pick_type' en los datos.")
+
+    # ----------------- GRÁFICOS DE ROI -----------------
+
+    st.markdown("### Gráficos de ROI")
+
+    # ROI acumulado en el tiempo
+    if "fecha" in df.columns and df["fecha"].notna().any():
+        df_time = df[df["fecha"].notna()].sort_values("fecha").copy()
+        df_time["profit_acum"] = df_time["profit_euros"].fillna(0).cumsum()
+        df_time["stake_acum"] = df_time["total_stake"].fillna(0).cumsum()
+        df_time["roi_acum"] = df_time.apply(
+            lambda r: r["profit_acum"] / r["stake_acum"] if r["stake_acum"] > 0 else None,
+            axis=1,
+        )
+
+        st.markdown("#### ROI acumulado en el tiempo")
+        st.line_chart(
+            df_time.set_index("fecha")[["roi_acum"]],
+            use_container_width=True,
+        )
+    else:
+        st.write("No hay fechas válidas para dibujar ROI acumulado.")
+
+    # ROI por división (barras)
+    if "division" in df.columns and "roi" in locals():
+        st.markdown("#### ROI por división (barras)")
+
+        if "division" in df.columns:
+            grp_div_plot = (
+                df.groupby("division")
+                .apply(lambda g: pd.Series({
+                    "profit_total": g["profit_euros"].fillna(0).sum(),
+                    "stake_total": g["total_stake"].fillna(0).sum(),
+                }))
+                .reset_index()
+            )
+            grp_div_plot["roi"] = grp_div_plot.apply(
+                lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else 0,
+                axis=1,
+            )
+            grp_div_plot = grp_div_plot.sort_values("roi", ascending=False)
+
+            st.bar_chart(
+                grp_div_plot.set_index("division")[["roi"]],
+                use_container_width=True,
+            )
+
+
+# ======================================================================
+# INTERFAZ PRINCIPAL
+# ======================================================================
 
 def main():
     st.set_page_config(
@@ -467,17 +649,21 @@ def main():
     st.sidebar.title("Navegación")
     modo = st.sidebar.radio(
         "Selecciona modo",
-        options=["Selector de partidos", "Gestión de apuestas"],
+        options=["Selector de partidos", "Gestión de apuestas", "Estadísticas ROI"],
     )
 
     if modo == "Selector de partidos":
         st.title("Selector de partidos HT/FT – Modelo")
         show_selector()
-    else:
+    elif modo == "Gestión de apuestas":
         st.title("Gestión de apuestas – Seguimiento")
         show_gestion()
+    else:
+        st.title("Estadísticas de ROI")
+        show_stats()
 
 
 if __name__ == "__main__":
     main()
+
 
