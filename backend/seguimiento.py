@@ -170,8 +170,8 @@ def update_seguimiento_from_df(
         if not changes:
             continue  # nada que actualizar en esta fila
 
-        # Forzamos ints en los minutos de cierre para evitar problemas de tipos
-        for minute_col in ["close_minute_global", "close_minute_1_1"]:
+        # Forzamos ints en los minutos de cierre y minuto del primer gol
+        for minute_col in ["close_minute_global", "close_minute_1_1", "first_goal_minute"]:
             if minute_col in changes:
                 changes[minute_col] = _to_int_or_none(changes[minute_col])
 
@@ -190,7 +190,7 @@ def update_seguimiento_row(row_id: int, changes: Dict) -> None:
     Actualiza una sola fila de 'seguimiento' por id, con los campos dados en changes.
     """
     # Normalizamos los campos que deben ser INT
-    for minute_col in ["close_minute_global", "close_minute_1_1"]:
+    for minute_col in ["close_minute_global", "close_minute_1_1", "first_goal_minute"]:
         if minute_col in changes:
             changes[minute_col] = _to_int_or_none(changes[minute_col])
 
