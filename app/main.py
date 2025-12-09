@@ -3,6 +3,7 @@
 import os
 import sys
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -289,14 +290,13 @@ def show_gestion():
 
     st.write(f"Registros filtrados: **{len(filtered)}**")
 
-    # Columnas editables (incluimos apuesta_real y first_goal_minute)
+    # Columnas editables (incluimos apuesta_real)
     editable_cols = [
         "stake_btts_no",
         "stake_u35",
         "stake_1_1",
         "close_minute_global",
         "close_minute_1_1",
-        "first_goal_minute",
         "odds_btts_no_init",
         "odds_u35_init",
         "odds_1_1_init",
@@ -396,12 +396,6 @@ def show_gestion():
             step=1,
         )
 
-        first_goal_minute = st.number_input(
-            "Minuto del primer gol",
-            value=int(row_sel["first_goal_minute"]) if pd.notna(row_sel.get("first_goal_minute")) else 0,
-            step=1,
-        )
-
         odds_btts_no_init = st.number_input(
             "Cuota inicial BTTS NO",
             value=float(row_sel["odds_btts_no_init"]) if pd.notna(row_sel.get("odds_btts_no_init")) else 0.0,
@@ -449,7 +443,6 @@ def show_gestion():
                 "stake_1_1": stake_1_1,
                 "close_minute_global": close_minute_global,
                 "close_minute_1_1": close_minute_1_1,
-                "first_goal_minute": first_goal_minute,
                 "odds_btts_no_init": odds_btts_no_init,
                 "odds_u35_init": odds_u35_init,
                 "odds_1_1_init": odds_1_1_init,
@@ -644,6 +637,250 @@ def show_stats():
 
 
 # ======================================================================
+# VISTA: SUPERVIVENCIA & CONVEXIDAD
+# ======================================================================
+
+def show_supervivencia_convexidad():
+    st.markdown("### Módulo de Supervivencia & Convexidad")
+
+    try:
+        df = fetch_seguimiento()
+    except Exception as e:
+        st.error(f"Error cargando datos de seguimiento: {e}")
+        return
+
+    if df.empty:
+        st.info("Todavía no hay apuestas en la tabla 'seguimiento'.")
+        return
+
+    # Normalizamos fecha
+    if "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+
+    # Comprobamos columna de minuto de primer gol
+    if "minuto_primer_gol" not in df.columns:
+        st.warning(
+            "La tabla 'seguimiento' no tiene la columna 'minuto_primer_gol'. "
+            "Añádela y rellénala para poder analizar supervivencia."
+        )
+        return
+
+    df["minuto_primer_gol"] = pd.to_numeric(df["minuto_primer_gol"], errors="coerce")
+
+    # ----------------- FILTROS -----------------
+    with st.expander("Filtros de selección para el análisis de supervivencia"):
+        # Rango de fechas
+        if "fecha" in df.columns and df["fecha"].notna().any():
+            min_date = df["fecha"].min().date()
+            max_date = df["fecha"].max().date()
+            fecha_desde, fecha_hasta = st.date_input(
+                "Rango de fechas",
+                value=(min_date, max_date),
+            )
+        else:
+            fecha_desde, fecha_hasta = None, None
+
+        # Filtro por division
+        divisiones = sorted([x for x in df.get("division", pd.Series()).dropna().unique()])
+        if divisiones:
+            div_filter = st.multiselect(
+                "Filtrar por división",
+                options=divisiones,
+                default=divisiones,
+            )
+        else:
+            div_filter = []
+
+        # Filtro por PickType
+        pick_types = sorted([x for x in df.get("pick_type", pd.Series()).dropna().unique()])
+        if pick_types:
+            pick_filter = st.multiselect(
+                "Filtrar por PickType",
+                options=pick_types,
+                default=pick_types,
+            )
+        else:
+            pick_filter = []
+
+        # Filtro por equipo
+        equipos = sorted(
+            set(df.get("home_team", pd.Series()).dropna().unique())
+            | set(df.get("away_team", pd.Series()).dropna().unique())
+        )
+        if equipos:
+            equipos_filter = st.multiselect(
+                "Filtrar por equipo (local o visitante)",
+                options=equipos,
+                default=[],
+            )
+        else:
+            equipos_filter = []
+
+        # Filtro por apuesta_real
+        if "apuesta_real" in df.columns:
+            ar_values = sorted([x for x in df["apuesta_real"].dropna().unique()])
+            if ar_values:
+                apuesta_real_filter = st.multiselect(
+                    "Filtrar por apuesta_real (SI/NO)",
+                    options=ar_values,
+                    default=ar_values,
+                )
+            else:
+                apuesta_real_filter = []
+        else:
+            apuesta_real_filter = []
+
+    # Aplicar filtros
+    mask = pd.Series(True, index=df.index)
+
+    if fecha_desde is not None and "fecha" in df.columns:
+        mask &= df["fecha"].dt.date >= fecha_desde
+    if fecha_hasta is not None and "fecha" in df.columns:
+        mask &= df["fecha"].dt.date <= fecha_hasta
+
+    if div_filter:
+        mask &= df["division"].isin(div_filter)
+
+    if pick_filter:
+        mask &= df["pick_type"].isin(pick_filter)
+
+    if equipos_filter:
+        mask &= df["home_team"].isin(equipos_filter) | df["away_team"].isin(equipos_filter)
+
+    if apuesta_real_filter and "apuesta_real" in df.columns:
+        mask &= df["apuesta_real"].isin(apuesta_real_filter)
+
+    df_filt = df[mask].copy()
+
+    if df_filt.empty:
+        st.warning("No hay registros que cumplan los filtros para analizar supervivencia.")
+        return
+
+    st.write(f"Partidos considerados en el análisis: **{len(df_filt)}**")
+
+    # ----------------- CURVA DE SUPERVIVENCIA S(t) -----------------
+    st.markdown("#### Curva S(t): probabilidad de llegar sin gol hasta el minuto t")
+
+    # Solo usamos filas donde conocemos minuto_primer_gol; interpretamos NaN como 'sin gol' (censura)
+    min_gol = df_filt["minuto_primer_gol"]
+
+    # Suponemos ventana hasta minuto 45 (primera parte) por defecto
+    max_minuto = int(np.nanmax(min_gol.dropna())) if min_gol.notna().any() else 45
+    max_minuto = max(45, min(max_minuto, 90))
+
+    minutos = np.arange(0, max_minuto + 1)
+    supervivencia = []
+
+    total_partidos = len(df_filt)
+
+    for t in minutos:
+        # Consideramos "sigue vivo" si:
+        #  - no tenemos dato de minuto_primer_gol (tratamos como > max_minuto)
+        #  - o el primer gol es después de t
+        vivos = ((min_gol.isna()) | (min_gol > t)).sum()
+        S_t = vivos / total_partidos
+        supervivencia.append(S_t)
+
+    surv_df = pd.DataFrame({"minuto": minutos, "S_t": supervivencia})
+    surv_df = surv_df.set_index("minuto")
+
+    st.line_chart(surv_df[["S_t"]], use_container_width=True)
+
+    st.markdown(
+        "S(t) representa la probabilidad empírica de que el partido siga sin gol hasta el minuto t "
+        "dentro del subconjunto filtrado. Esta es la base del módulo de 'Supervivencia & Convexidad'."
+    )
+
+    # ----------------- ZONA DE MUERTE -----------------
+    st.markdown("#### Zona de muerte (probabilidad de gol temprano)")
+
+    zona_muerte_max = st.slider(
+        "Límite superior de la zona de muerte (minuto)",
+        min_value=1,
+        max_value=45,
+        value=15,
+    )
+
+    # Probabilidad de que el primer gol llegue en la zona de muerte
+    p_muerte = (min_gol.notna() & (min_gol <= zona_muerte_max)).sum() / total_partidos
+    p_supervivir = 1 - p_muerte
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.metric(
+            f"P(gol en {zona_muerte_max}' o antes)",
+            f"{p_muerte*100:.1f} %",
+        )
+    with col_b:
+        st.metric(
+            f"P(sobrevivir más allá de {zona_muerte_max}')",
+            f"{p_supervivir*100:.1f} %",
+        )
+
+    st.markdown(
+        "La **zona de muerte** agrupa los minutos donde un gol temprano destruye la convexidad. "
+        "Tu modelo de selección está diseñado precisamente para minimizar esta probabilidad."
+    )
+
+    # ----------------- EV RELATIVO POR MINUTO / BLOQUE -----------------
+    st.markdown("#### EV relativo por bloques de minutos (proxy de convexidad)")
+
+    # Aseguramos campos numéricos para stakes y profit
+    for col in ["stake_btts_no", "stake_u35", "stake_1_1", "profit_euros"]:
+        if col in df_filt.columns:
+            df_filt[col] = pd.to_numeric(df_filt[col], errors="coerce")
+
+    df_filt["total_stake"] = (
+        df_filt.get("stake_btts_no", 0).fillna(0)
+        + df_filt.get("stake_u35", 0).fillna(0)
+        + df_filt.get("stake_1_1", 0).fillna(0)
+    )
+
+    # Creamos bloques de 5 minutos
+    bins = list(range(0, 50, 5))  # 0-5, 5-10, ..., 45-50
+    labels = [f"{b}-{b+5}" for b in bins[:-1]]
+
+    df_filt["bloque_min_gol"] = pd.cut(
+        df_filt["minuto_primer_gol"],
+        bins=bins,
+        labels=labels,
+        right=False,
+        include_lowest=True,
+    )
+
+    # Los partidos sin gol en la primera parte los marcamos como "sin_gol_45"
+    df_filt.loc[df_filt["minuto_primer_gol"].isna(), "bloque_min_gol"] = "sin_gol_45"
+
+    grp_blocks = (
+        df_filt.groupby("bloque_min_gol")
+        .apply(lambda g: pd.Series({
+            "n_partidos": len(g),
+            "profit_total": g["profit_euros"].fillna(0).sum(),
+            "stake_total": g["total_stake"].fillna(0).sum(),
+        }))
+        .reset_index()
+    )
+
+    grp_blocks["roi"] = grp_blocks.apply(
+        lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else None,
+        axis=1,
+    )
+
+    st.dataframe(grp_blocks, use_container_width=True)
+
+    # Gráfico de ROI por bloque de minuto de primer gol
+    grp_blocks_plot = grp_blocks.dropna(subset=["roi"]).copy()
+    if not grp_blocks_plot.empty:
+        st.markdown("##### ROI por bloque de minuto del primer gol")
+        st.bar_chart(
+            grp_blocks_plot.set_index("bloque_min_gol")[["roi"]],
+            use_container_width=True,
+        )
+    else:
+        st.write("No hay suficientes datos con stakes/profit para calcular ROI por bloque.")
+
+
+# ======================================================================
 # INTERFAZ PRINCIPAL
 # ======================================================================
 
@@ -656,7 +893,12 @@ def main():
     st.sidebar.title("Navegación")
     modo = st.sidebar.radio(
         "Selecciona modo",
-        options=["Selector de partidos", "Gestión de apuestas", "Estadísticas ROI"],
+        options=[
+            "Selector de partidos",
+            "Gestión de apuestas",
+            "Estadísticas ROI",
+            "Supervivencia & Convexidad",
+        ],
     )
 
     if modo == "Selector de partidos":
@@ -665,9 +907,12 @@ def main():
     elif modo == "Gestión de apuestas":
         st.title("Gestión de apuestas – Seguimiento")
         show_gestion()
-    else:
+    elif modo == "Estadísticas ROI":
         st.title("Estadísticas de ROI")
         show_stats()
+    else:
+        st.title("Módulo Supervivencia & Convexidad")
+        show_supervivencia_convexidad()
 
 
 if __name__ == "__main__":
