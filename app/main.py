@@ -22,10 +22,6 @@ from backend.seguimiento import (  # type: ignore
     update_seguimiento_from_df,
     update_seguimiento_row,
 )
-from backend.banca import (  # type: ignore
-    fetch_banca_movimientos,
-    insert_banca_movimiento,
-)
 
 
 # ---------- CARGA HISTÓRICO (CACHEADO) ----------
@@ -238,7 +234,7 @@ def show_gestion():
         else:
             div_filter = []
 
-        # Filtro por equipo (local o visitante)
+        # Filtro por equipo (aparece como local o visitante)
         equipos = sorted(
             set(df.get("home_team", pd.Series()).dropna().unique())
             | set(df.get("away_team", pd.Series()).dropna().unique())
@@ -293,13 +289,14 @@ def show_gestion():
 
     st.write(f"Registros filtrados: **{len(filtered)}**")
 
-    # Columnas editables (incluimos apuesta_real)
+    # Columnas editables (incluimos apuesta_real y first_goal_minute)
     editable_cols = [
         "stake_btts_no",
         "stake_u35",
         "stake_1_1",
         "close_minute_global",
         "close_minute_1_1",
+        "first_goal_minute",
         "odds_btts_no_init",
         "odds_u35_init",
         "odds_1_1_init",
@@ -399,6 +396,12 @@ def show_gestion():
             step=1,
         )
 
+        first_goal_minute = st.number_input(
+            "Minuto del primer gol",
+            value=int(row_sel["first_goal_minute"]) if pd.notna(row_sel.get("first_goal_minute")) else 0,
+            step=1,
+        )
+
         odds_btts_no_init = st.number_input(
             "Cuota inicial BTTS NO",
             value=float(row_sel["odds_btts_no_init"]) if pd.notna(row_sel.get("odds_btts_no_init")) else 0.0,
@@ -425,7 +428,7 @@ def show_gestion():
         total_stake = stake_btts_no + stake_u35 + stake_1_1
         if total_stake > 0:
             roi_calc = profit_euros / total_stake
-            st.write(f"ROI calculado: **{roi_calc*100:.2f}%** (profit / suma de stakes)")
+            st.write(f"ROI calculado: **{roi_calc:.3f}** (profit / suma de stakes)")
         else:
             roi_calc = None
             st.write("ROI calculado: — (faltan stakes o profit)")
@@ -446,6 +449,7 @@ def show_gestion():
                 "stake_1_1": stake_1_1,
                 "close_minute_global": close_minute_global,
                 "close_minute_1_1": close_minute_1_1,
+                "first_goal_minute": first_goal_minute,
                 "odds_btts_no_init": odds_btts_no_init,
                 "odds_u35_init": odds_u35_init,
                 "odds_1_1_init": odds_1_1_init,
@@ -453,6 +457,7 @@ def show_gestion():
                 "apuesta_real": apuesta_real,
             }
 
+            # Solo enviamos ROI si se ha podido calcular
             if roi_calc is not None:
                 cambios["roi"] = roi_calc
             else:
@@ -466,13 +471,12 @@ def show_gestion():
 
 
 # ======================================================================
-# VISTA: ESTADÍSTICAS ROI + BANCA
+# VISTA: ESTADÍSTICAS ROI
 # ======================================================================
 
 def show_stats():
-    st.markdown("### Estadísticas de ROI y gestión de banca")
+    st.markdown("### Estadísticas de ROI")
 
-    # ----------- Cargamos apuestas -----------
     try:
         df = fetch_seguimiento()
     except Exception as e:
@@ -487,295 +491,156 @@ def show_stats():
     if "fecha" in df.columns:
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
 
-    # Aseguramos numéricos
+    # Calculamos total_stake y roi_calculado (independiente del campo roi guardado)
     for col in ["stake_btts_no", "stake_u35", "stake_1_1", "profit_euros"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Total stake por apuesta
     df["total_stake"] = (
         df.get("stake_btts_no", 0).fillna(0)
         + df.get("stake_u35", 0).fillna(0)
         + df.get("stake_1_1", 0).fillna(0)
     )
 
-    # ----------- FILTROS (igual filosofía que en Gestión) -----------
-    with st.expander("Filtros de apuestas"):
-        # Rango de fechas
-        if "fecha" in df.columns and df["fecha"].notna().any():
-            min_date = df["fecha"].min().date()
-            max_date = df["fecha"].max().date()
-            fecha_desde, fecha_hasta = st.date_input(
-                "Rango de fechas",
-                value=(min_date, max_date),
-                key="stats_fecha_rango",
-            )
-        else:
-            fecha_desde, fecha_hasta = None, None
+    df["roi_calc"] = None
+    mask_valid = (df["total_stake"] > 0) & df["profit_euros"].notna()
+    df.loc[mask_valid, "roi_calc"] = df.loc[mask_valid, "profit_euros"] / df.loc[mask_valid, "total_stake"]
 
-        # Filtro por pick_type
-        pick_types = sorted([x for x in df.get("pick_type", pd.Series()).dropna().unique()])
-        if pick_types:
-            pick_filter = st.multiselect(
-                "Filtrar por PickType",
-                options=pick_types,
-                default=pick_types,
-                key="stats_pick_filter",
-            )
-        else:
-            pick_filter = []
-
-        # Filtro por division
-        divisiones = sorted([x for x in df.get("division", pd.Series()).dropna().unique()])
-        if divisiones:
-            div_filter = st.multiselect(
-                "Filtrar por división",
-                options=divisiones,
-                default=divisiones,
-                key="stats_div_filter",
-            )
-        else:
-            div_filter = []
-
-        # Filtro por equipo (local o visitante)
-        equipos = sorted(
-            set(df.get("home_team", pd.Series()).dropna().unique())
-            | set(df.get("away_team", pd.Series()).dropna().unique())
+    # Filtro por apuesta_real (para separar reales de simuladas)
+    apuesta_real_opts = sorted([x for x in df.get("apuesta_real", pd.Series()).dropna().unique()])
+    if apuesta_real_opts:
+        ar_sel = st.multiselect(
+            "Filtrar por tipo de apuesta",
+            options=apuesta_real_opts,
+            default=apuesta_real_opts,
         )
-        if equipos:
-            equipos_filter = st.multiselect(
-                "Filtrar por equipo (local o visitante)",
-                options=equipos,
-                default=[],
-                key="stats_equipos_filter",
-            )
-        else:
-            equipos_filter = []
+        df = df[df["apuesta_real"].isin(ar_sel)]
 
-        # Filtro por apuesta_real
-        if "apuesta_real" in df.columns:
-            ar_values = sorted([x for x in df["apuesta_real"].dropna().unique()])
-            if ar_values:
-                apuesta_real_filter = st.multiselect(
-                    "Filtrar por apuesta_real (SI/NO)",
-                    options=ar_values,
-                    default=ar_values,
-                    key="stats_ar_filter",
-                )
-            else:
-                apuesta_real_filter = []
-        else:
-            apuesta_real_filter = []
-
-    mask = pd.Series(True, index=df.index)
-
-    if fecha_desde is not None and "fecha" in df.columns:
-        mask &= df["fecha"].dt.date >= fecha_desde
-    if fecha_hasta is not None and "fecha" in df.columns:
-        mask &= df["fecha"].dt.date <= fecha_hasta
-
-    if pick_filter:
-        mask &= df["pick_type"].isin(pick_filter)
-    if div_filter:
-        mask &= df["division"].isin(div_filter)
-
-    if equipos_filter:
-        mask &= df["home_team"].isin(equipos_filter) | df["away_team"].isin(equipos_filter)
-
-    if apuesta_real_filter and "apuesta_real" in df.columns:
-        mask &= df["apuesta_real"].isin(apuesta_real_filter)
-
-    df_filt = df[mask].copy()
-
-    if df_filt.empty:
-        st.warning("No hay apuestas que cumplan los filtros seleccionados.")
+    if df.empty:
+        st.warning("No hay registros tras aplicar el filtro de apuesta_real.")
         return
 
-    # ----------- ROI sobre importe apostado -----------
+    # ----------------- TABLAS DE ROI -----------------
 
-    total_profit = df_filt["profit_euros"].fillna(0).sum()
-    total_stake_sum = df_filt["total_stake"].fillna(0).sum()
-    roi_stake = total_profit / total_stake_sum if total_stake_sum > 0 else None
+    # ROI global
+    total_profit = df["profit_euros"].fillna(0).sum()
+    total_stake_sum = df["total_stake"].fillna(0).sum()
+    roi_global = total_profit / total_stake_sum if total_stake_sum > 0 else None
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Profit total (€)", f"{total_profit:,.2f}")
+        st.metric("Total profit (€)", f"{total_profit:,.2f}")
     with col2:
-        st.metric("Stake total (€)", f"{total_stake_sum:,.2f}")
+        st.metric("Total stake (€)", f"{total_stake_sum:,.2f}")
     with col3:
-        if roi_stake is not None:
-            st.metric("ROI sobre importe apostado", f"{roi_stake*100:.2f}%")
+        if roi_global is not None:
+            st.metric("ROI global", f"{roi_global:.3f}")
         else:
-            st.metric("ROI sobre importe apostado", "—")
+            st.metric("ROI global", "—")
 
-    # ROI diario sobre importe apostado y ROI acumulado
-    if "fecha" in df_filt.columns and df_filt["fecha"].notna().any():
-        df_time = df_filt[df_filt["fecha"].notna()].copy()
-        df_time = df_time.sort_values("fecha")
+    st.markdown("#### ROI por tipo de apuesta (apuesta_real)")
 
-        diario = (
-            df_time.groupby(df_time["fecha"].dt.date)
-            .agg(
-                profit_diario=("profit_euros", "sum"),
-                stake_diario=("total_stake", "sum"),
-            )
+    if "apuesta_real" in df.columns:
+        grp_ar = (
+            df.groupby("apuesta_real")
+            .apply(lambda g: pd.Series({
+                "profit_total": g["profit_euros"].fillna(0).sum(),
+                "stake_total": g["total_stake"].fillna(0).sum(),
+            }))
             .reset_index()
-            .rename(columns={"fecha": "fecha_dia"})
         )
+        grp_ar["roi"] = grp_ar.apply(
+            lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else None,
+            axis=1,
+        )
+        st.dataframe(grp_ar, use_container_width=True)
+    else:
+        st.write("No existe columna 'apuesta_real' en los datos.")
 
-        diario["roi_dia"] = diario.apply(
-            lambda r: (r["profit_diario"] / r["stake_diario"]) * 100
-            if r["stake_diario"] > 0 else None,
+    st.markdown("#### ROI por división")
+
+    if "division" in df.columns:
+        grp_div = (
+            df.groupby("division")
+            .apply(lambda g: pd.Series({
+                "profit_total": g["profit_euros"].fillna(0).sum(),
+                "stake_total": g["total_stake"].fillna(0).sum(),
+                "n_apuestas": len(g),
+            }))
+            .reset_index()
+        )
+        grp_div["roi"] = grp_div.apply(
+            lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else None,
+            axis=1,
+        )
+        st.dataframe(grp_div.sort_values("roi", ascending=False), use_container_width=True)
+    else:
+        st.write("No existe columna 'division' en los datos.")
+
+    st.markdown("#### ROI por PickType")
+
+    if "pick_type" in df.columns:
+        grp_pick = (
+            df.groupby("pick_type")
+            .apply(lambda g: pd.Series({
+                "profit_total": g["profit_euros"].fillna(0).sum(),
+                "stake_total": g["total_stake"].fillna(0).sum(),
+                "n_apuestas": len(g),
+            }))
+            .reset_index()
+        )
+        grp_pick["roi"] = grp_pick.apply(
+            lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else None,
+            axis=1,
+        )
+        st.dataframe(grp_pick.sort_values("roi", ascending=False), use_container_width=True)
+    else:
+        st.write("No existe columna 'pick_type' en los datos.")
+
+    # ----------------- GRÁFICOS DE ROI -----------------
+
+    st.markdown("### Gráficos de ROI")
+
+    # ROI acumulado en el tiempo
+    if "fecha" in df.columns and df["fecha"].notna().any():
+        df_time = df[df["fecha"].notna()].sort_values("fecha").copy()
+        df_time["profit_acum"] = df_time["profit_euros"].fillna(0).cumsum()
+        df_time["stake_acum"] = df_time["total_stake"].fillna(0).cumsum()
+        df_time["roi_acum"] = df_time.apply(
+            lambda r: r["profit_acum"] / r["stake_acum"] if r["stake_acum"] > 0 else None,
             axis=1,
         )
 
-        diario["profit_acum"] = diario["profit_diario"].cumsum()
-        diario["stake_acum"] = diario["stake_diario"].cumsum()
-        diario["roi_acum"] = diario.apply(
-            lambda r: (r["profit_acum"] / r["stake_acum"]) * 100
-            if r["stake_acum"] > 0 else None,
-            axis=1,
-        )
-
-        st.markdown("#### ROI diario y acumulado sobre importe apostado (%)")
+        st.markdown("#### ROI acumulado en el tiempo")
         st.line_chart(
-            diario.set_index("fecha_dia")[["roi_dia", "roi_acum"]],
+            df_time.set_index("fecha")[["roi_acum"]],
             use_container_width=True,
         )
     else:
-        st.write("No hay fechas válidas para dibujar ROI diario/acumulado sobre stake.")
+        st.write("No hay fechas válidas para dibujar ROI acumulado.")
 
-    # ----------- BLOQUE: GESTIÓN DE BANCA -----------
+    # ROI por división (barras)
+    if "division" in df.columns:
+        st.markdown("#### ROI por división (barras)")
 
-    st.markdown("---")
-    st.markdown("### Gestión de banca (depósitos, retiradas, ROI sobre capital)")
+        grp_div_plot = (
+            df.groupby("division")
+            .apply(lambda g: pd.Series({
+                "profit_total": g["profit_euros"].fillna(0).sum(),
+                "stake_total": g["total_stake"].fillna(0).sum(),
+            }))
+            .reset_index()
+        )
+        grp_div_plot["roi"] = grp_div_plot.apply(
+            lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else 0,
+            axis=1,
+        )
+        grp_div_plot = grp_div_plot.sort_values("roi", ascending=False)
 
-    # Formulario para añadir movimientos de banca
-    with st.expander("Registrar nuevo movimiento de banca"):
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            fecha_mov = st.date_input("Fecha del movimiento")
-            tipo_mov = st.selectbox("Tipo", ["DEPOSITO", "RETIRADA", "AJUSTE"])
-        with col_f2:
-            importe_mov = st.number_input("Importe (€)", min_value=0.0, step=10.0)
-            comentario_mov = st.text_input("Comentario", value="")
-
-        if st.button("Guardar movimiento de banca"):
-            try:
-                # Para RETIRADA, el importe se guarda positivo; el signo se gestiona al calcular flujos
-                insert_banca_movimiento(
-                    fecha=fecha_mov,
-                    tipo=tipo_mov,
-                    importe=importe_mov,
-                    comentario=comentario_mov or None,
-                )
-                st.success("Movimiento de banca guardado correctamente.")
-                st.experimental_rerun()
-            except Exception as e:
-                st.error(f"Error guardando movimiento de banca: {e}")
-
-    # Cargamos movimientos
-    try:
-        df_banca = fetch_banca_movimientos()
-    except Exception as e:
-        st.error(f"Error cargando banca_movimientos: {e}")
-        return
-
-    if df_banca.empty:
-        st.info("No hay movimientos de banca registrados. "
-                "Registra al menos un DEPOSITO para poder calcular la banca.")
-        return
-
-    # Tabla simple de movimientos
-    st.markdown("#### Movimientos de banca")
-    st.dataframe(df_banca.sort_values("fecha"), use_container_width=True)
-
-    # Cálculo de serie temporal de banca + ROI sobre capital aportado
-    df_b = df_banca.copy()
-    df_b = df_b[df_b["fecha"].notna()]
-    df_b = df_b.sort_values("fecha")
-
-    # Flujos netos: DEPOSITO / AJUSTE suman, RETIRADA resta
-    def flujo_signo(row):
-        tipo = (row.get("tipo") or "").upper()
-        imp = row.get("importe") or 0
-        if tipo == "DEPOSITO" or tipo == "AJUSTE":
-            return float(imp)
-        elif tipo == "RETIRADA":
-            return -float(imp)
-        return float(imp)
-
-    df_b["net_flow"] = df_b.apply(flujo_signo, axis=1)
-
-    diario_banca = (
-        df_b.groupby(df_b["fecha"].dt.date)
-        .agg(net_flow_diario=("net_flow", "sum"))
-        .reset_index()
-        .rename(columns={"fecha": "fecha_dia"})
-    )
-
-    # Profit diario solo de apuestas reales SI (filtrado igual que arriba)
-    df_filt_real = df_filt[df_filt.get("apuesta_real", "SI").isin(["SI"])].copy()
-    df_filt_real = df_filt_real[df_filt_real["fecha"].notna()]
-
-    diario_profit = (
-        df_filt_real.groupby(df_filt_real["fecha"].dt.date)
-        .agg(profit_diario=("profit_euros", "sum"))
-        .reset_index()
-        .rename(columns={"fecha": "fecha_dia"})
-    )
-
-    # Unión de fechas (banca + apuestas)
-    fechas_union = sorted(
-        set(diario_banca["fecha_dia"].unique())
-        | set(diario_profit["fecha_dia"].unique())
-    )
-
-    ts = pd.DataFrame({"fecha_dia": fechas_union})
-
-    ts = ts.merge(diario_banca, on="fecha_dia", how="left")
-    ts = ts.merge(diario_profit, on="fecha_dia", how="left")
-
-    ts["net_flow_diario"] = ts["net_flow_diario"].fillna(0.0)
-    ts["profit_diario"] = ts["profit_diario"].fillna(0.0)
-
-    ts["net_flow_acum"] = ts["net_flow_diario"].cumsum()
-    ts["profit_acum"] = ts["profit_diario"].cumsum()
-
-    # Banca = flujos externos + profit de apuestas
-    ts["banca"] = ts["net_flow_acum"] + ts["profit_acum"]
-
-    # ROI sobre capital aportado (net_flow_acum) -> (banca - aportado) / aportado
-    ts["roi_banca"] = ts.apply(
-        lambda r: ((r["banca"] - r["net_flow_acum"]) / r["net_flow_acum"]) * 100
-        if r["net_flow_acum"] > 0 else None,
-        axis=1,
-    )
-
-    # Métricas finales sobre banca
-    banca_actual = ts["banca"].iloc[-1]
-    aportado_total = ts["net_flow_acum"].iloc[-1]
-    roi_banca_final = ts["roi_banca"].dropna().iloc[-1] if ts["roi_banca"].notna().any() else None
-
-    colb1, colb2, colb3 = st.columns(3)
-    with colb1:
-        st.metric("Capital aportado neto (€)", f"{aportado_total:,.2f}")
-    with colb2:
-        st.metric("Banca actual (€)", f"{banca_actual:,.2f}")
-    with colb3:
-        if roi_banca_final is not None:
-            st.metric("ROI sobre capital aportado", f"{roi_banca_final:.2f}%")
-        else:
-            st.metric("ROI sobre capital aportado", "—")
-
-    # Gráficos de banca y ROI sobre banca
-    ts_plot = ts.set_index("fecha_dia")
-
-    st.markdown("#### Evolución de la banca (€)")
-    st.line_chart(ts_plot[["banca"]], use_container_width=True)
-
-    st.markdown("#### ROI sobre capital aportado (%)")
-    st.line_chart(ts_plot[["roi_banca"]], use_container_width=True)
+        st.bar_chart(
+            grp_div_plot.set_index("division")[["roi"]],
+            use_container_width=True,
+        )
 
 
 # ======================================================================
@@ -791,7 +656,7 @@ def main():
     st.sidebar.title("Navegación")
     modo = st.sidebar.radio(
         "Selecciona modo",
-        options=["Selector de partidos", "Gestión de apuestas", "Estadísticas ROI / Banca"],
+        options=["Selector de partidos", "Gestión de apuestas", "Estadísticas ROI"],
     )
 
     if modo == "Selector de partidos":
@@ -801,7 +666,7 @@ def main():
         st.title("Gestión de apuestas – Seguimiento")
         show_gestion()
     else:
-        st.title("Estadísticas de ROI y gestión de banca")
+        st.title("Estadísticas de ROI")
         show_stats()
 
 
