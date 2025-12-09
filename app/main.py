@@ -22,6 +22,11 @@ from backend.seguimiento import (  # type: ignore
     update_seguimiento_from_df,
     update_seguimiento_row,
 )
+from backend.banca import (  # type: ignore
+    fetch_banca_movimientos,
+    insert_banca_movimiento,
+    compute_banca_series,
+)
 
 
 # ---------- CARGA HISTÓRICO (CACHEADO) ----------
@@ -417,11 +422,11 @@ def show_gestion():
             step=1.0,
         )
 
-        # ROI calculado automáticamente: profit / suma de stakes
+        # ROI calculado automáticamente (profit / suma de stakes)
         total_stake = stake_btts_no + stake_u35 + stake_1_1
         if total_stake > 0:
             roi_calc = profit_euros / total_stake
-            st.write(f"ROI calculado: **{roi_calc * 100:.2f}%** (profit / suma de stakes)")
+            st.write(f"ROI calculado: **{roi_calc*100:.2f}%** (profit / suma de stakes)")
         else:
             roi_calc = None
             st.write("ROI calculado: — (faltan stakes o profit)")
@@ -449,7 +454,6 @@ def show_gestion():
                 "apuesta_real": apuesta_real,
             }
 
-            # Solo enviamos ROI si se ha podido calcular
             if roi_calc is not None:
                 cambios["roi"] = roi_calc
             else:
@@ -463,20 +467,13 @@ def show_gestion():
 
 
 # ======================================================================
-# VISTA: ESTADÍSTICAS ROI
+# VISTA: ESTADÍSTICAS ROI + GESTIÓN DE BANCA
 # ======================================================================
 
 def show_stats():
-    st.markdown("### Estadísticas de ROI")
+    st.markdown("### Estadísticas de ROI y gestión de banca")
 
-    # Banca inicial (para curva de banca acumulada)
-    banca_inicial = st.number_input(
-        "Banca inicial (€) para calcular banca acumulada (sin movimientos aún)",
-        min_value=0.0,
-        value=1000.0,
-        step=100.0,
-    )
-
+    # ----------------- CARGA DE APUESTAS -----------------
     try:
         df = fetch_seguimiento()
     except Exception as e:
@@ -487,11 +484,10 @@ def show_stats():
         st.info("Todavía no hay apuestas en la tabla 'seguimiento'.")
         return
 
-    # Normalizamos fecha
+    # Normalizamos fecha y campos numéricos importantes
     if "fecha" in df.columns:
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
 
-    # Normalizamos numéricos
     for col in ["stake_btts_no", "stake_u35", "stake_1_1", "profit_euros"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -502,24 +498,22 @@ def show_stats():
         + df.get("stake_1_1", 0).fillna(0)
     )
 
-    df["roi_calc"] = None
-    mask_valid = (df["total_stake"] > 0) & df["profit_euros"].notna()
-    df.loc[mask_valid, "roi_calc"] = df.loc[mask_valid, "profit_euros"] / df.loc[mask_valid, "total_stake"]
-
     # ----------------- FILTROS ROI -----------------
-    with st.expander("Filtros"):
+    st.markdown("#### Filtros de apuestas para ROI")
+
+    with st.expander("Filtros ROI"):
         # Rango de fechas
         if "fecha" in df.columns and df["fecha"].notna().any():
             min_date = df["fecha"].min().date()
             max_date = df["fecha"].max().date()
             fecha_desde, fecha_hasta = st.date_input(
-                "Rango de fechas (estadísticas)",
+                "Rango de fechas",
                 value=(min_date, max_date),
             )
         else:
             fecha_desde, fecha_hasta = None, None
 
-        # PickType
+        # Filtro por pick_type
         pick_types = sorted([x for x in df.get("pick_type", pd.Series()).dropna().unique()])
         if pick_types:
             pick_filter = st.multiselect(
@@ -530,7 +524,7 @@ def show_stats():
         else:
             pick_filter = []
 
-        # División
+        # Filtro por division
         divisiones = sorted([x for x in df.get("division", pd.Series()).dropna().unique()])
         if divisiones:
             div_filter = st.multiselect(
@@ -541,7 +535,7 @@ def show_stats():
         else:
             div_filter = []
 
-        # Equipo (home o away)
+        # Filtro por equipo (local o visitante)
         equipos = sorted(
             set(df.get("home_team", pd.Series()).dropna().unique())
             | set(df.get("away_team", pd.Series()).dropna().unique())
@@ -555,18 +549,20 @@ def show_stats():
         else:
             equipos_filter = []
 
-        # apuesta_real
-        apuesta_real_opts = sorted([x for x in df.get("apuesta_real", pd.Series()).dropna().unique()])
-        if apuesta_real_opts:
-            ar_sel = st.multiselect(
-                "Filtrar por tipo de apuesta (apuesta_real)",
-                options=apuesta_real_opts,
-                default=apuesta_real_opts,
-            )
+        # Filtro por apuesta_real
+        if "apuesta_real" in df.columns:
+            ar_values = sorted([x for x in df["apuesta_real"].dropna().unique()])
+            if ar_values:
+                apuesta_real_filter = st.multiselect(
+                    "Filtrar por apuesta_real (SI/NO)",
+                    options=ar_values,
+                    default=ar_values,
+                )
+            else:
+                apuesta_real_filter = []
         else:
-            ar_sel = []
+            apuesta_real_filter = []
 
-    # Aplicar filtros
     mask = pd.Series(True, index=df.index)
 
     if fecha_desde is not None and "fecha" in df.columns:
@@ -582,16 +578,62 @@ def show_stats():
     if equipos_filter:
         mask &= df["home_team"].isin(equipos_filter) | df["away_team"].isin(equipos_filter)
 
-    if ar_sel:
-        mask &= df["apuesta_real"].isin(ar_sel)
+    if apuesta_real_filter and "apuesta_real" in df.columns:
+        mask &= df["apuesta_real"].isin(apuesta_real_filter)
 
     df = df[mask].copy()
 
     if df.empty:
-        st.warning("No hay registros tras aplicar los filtros de estadísticas.")
+        st.warning("No hay apuestas tras aplicar los filtros.")
         return
 
-    # ----------------- TABLAS DE ROI -----------------
+    # ROI por apuesta (calculado)
+    df["roi_calc"] = None
+    mask_valid = (df["total_stake"] > 0) & df["profit_euros"].notna()
+    df.loc[mask_valid, "roi_calc"] = df.loc[mask_valid, "profit_euros"] / df.loc[mask_valid, "total_stake"]
+
+    # ----------------- CONFIGURACIÓN DE BANCA -----------------
+    st.markdown("#### Configuración de banca")
+
+    col_init1, col_init2 = st.columns(2)
+    with col_init1:
+        banca_inicial = st.number_input(
+            "Banca inicial (€)",
+            min_value=0.0,
+            value=1000.0,
+            step=100.0,
+        )
+
+    # Movimientos de banca
+    try:
+        df_mov = fetch_banca_movimientos()
+    except Exception as e:
+        st.error(f"Error cargando banca_movimientos: {e}")
+        df_mov = pd.DataFrame()
+
+    with col_init2:
+        st.write(f"Movimientos registrados: **{len(df_mov)}**")
+
+    # Formulario rápido para añadir movimiento
+    with st.expander("Añadir movimiento de banca"):
+        with st.form("form_banca_mov"):
+            fecha_mov = st.date_input("Fecha movimiento")
+            tipo_mov = st.selectbox(
+                "Tipo de movimiento",
+                options=["DEPOSITO", "RETIRADA", "AJUSTE"],
+            )
+            importe_mov = st.number_input("Importe (€)", step=10.0, value=0.0)
+            comentario_mov = st.text_input("Comentario (opcional)", value="")
+            submit_mov = st.form_submit_button("Guardar movimiento")
+
+            if submit_mov:
+                try:
+                    insert_banca_movimiento(fecha_mov, tipo_mov, importe_mov, comentario_mov or None)
+                    st.success("Movimiento de banca guardado correctamente. Recarga la página para verlo reflejado.")
+                except Exception as e:
+                    st.error(f"Error guardando movimiento de banca: {e}")
+
+    # ----------------- MÉTRICAS GLOBAL ROI SOBRE STAKE -----------------
     total_profit = df["profit_euros"].fillna(0).sum()
     total_stake_sum = df["total_stake"].fillna(0).sum()
     roi_global = total_profit / total_stake_sum if total_stake_sum > 0 else None
@@ -603,10 +645,33 @@ def show_stats():
         st.metric("Total stake (€)", f"{total_stake_sum:,.2f}")
     with col3:
         if roi_global is not None:
-            st.metric("ROI global sobre importe apostado", f"{roi_global * 100:.2f}%")
+            st.metric("ROI global sobre stake", f"{roi_global*100:.2f}%")
         else:
-            st.metric("ROI global sobre importe apostado", "—")
+            st.metric("ROI global sobre stake", "—")
 
+    # ----------------- SERIE DE BANCA Y ROI SOBRE BANCA -----------------
+    banca_series = compute_banca_series(banca_inicial, df_mov, df)
+
+    if not banca_series.empty:
+        last = banca_series.iloc[-1]
+        roi_ini = last["roi_sobre_inicial"]
+        roi_cap = last["roi_sobre_capital_acum"]
+
+        colb1, colb2, colb3 = st.columns(3)
+        with colb1:
+            st.metric("Banca actual (€)", f"{last['banca_actual']:,.2f}")
+        with colb2:
+            if roi_ini is not None:
+                st.metric("ROI sobre banca inicial", f"{roi_ini*100:.2f}%")
+            else:
+                st.metric("ROI sobre banca inicial", "—")
+        with colb3:
+            if roi_cap is not None:
+                st.metric("ROI sobre capital acumulado", f"{roi_cap*100:.2f}%")
+            else:
+                st.metric("ROI sobre capital acumulado", "—")
+
+    # ----------------- TABLAS DE ROI (en %) -----------------
     st.markdown("#### ROI por tipo de apuesta (apuesta_real)")
 
     if "apuesta_real" in df.columns:
@@ -670,55 +735,48 @@ def show_stats():
     # ----------------- GRÁFICOS DE ROI -----------------
     st.markdown("### Gráficos de ROI")
 
-    # ROI acumulado en el tiempo (sobre stake)
+    # ROI acumulado sobre stake (en %)
     if "fecha" in df.columns and df["fecha"].notna().any():
         df_time = df[df["fecha"].notna()].sort_values("fecha").copy()
         df_time["profit_acum"] = df_time["profit_euros"].fillna(0).cumsum()
         df_time["stake_acum"] = df_time["total_stake"].fillna(0).cumsum()
-        df_time["roi_acum_pct"] = df_time.apply(
+        df_time["roi_acum_stake"] = df_time.apply(
             lambda r: (r["profit_acum"] / r["stake_acum"] * 100) if r["stake_acum"] > 0 else None,
             axis=1,
         )
 
-        st.markdown("#### ROI acumulado sobre importe apostado (%)")
+        st.markdown("#### ROI acumulado sobre stake (%)")
         st.line_chart(
-            df_time.set_index("fecha")[["roi_acum_pct"]],
+            df_time.set_index("fecha")[["roi_acum_stake"]],
             use_container_width=True,
         )
-
-        # Curva de banca acumulada (simple: banca inicial + beneficio acumulado)
-        df_time["banca_acum"] = banca_inicial + df_time["profit_acum"]
-
-        st.markdown("#### Banca acumulada (banca inicial + profit acumulado)")
-        st.line_chart(
-            df_time.set_index("fecha")[["banca_acum"]],
-            use_container_width=True,
-        )
-
     else:
-        st.write("No hay fechas válidas para dibujar ROI acumulado.")
+        st.write("No hay fechas válidas para dibujar ROI acumulado sobre stake.")
 
-    # ROI por división (barras)
-    if "division" in df.columns:
-        grp_div_plot = (
-            df.groupby("division")
-            .apply(lambda g: pd.Series({
-                "profit_total": g["profit_euros"].fillna(0).sum(),
-                "stake_total": g["total_stake"].fillna(0).sum(),
-            }))
-            .reset_index()
+    # Serie de banca y ROI sobre banca
+    if not banca_series.empty:
+        df_banca = banca_series.copy()
+        df_banca = df_banca.sort_values("fecha")
+        df_banca["roi_ini_pct"] = df_banca["roi_sobre_inicial"].apply(
+            lambda x: x * 100 if x is not None else None
         )
-        grp_div_plot["roi_pct"] = grp_div_plot.apply(
-            lambda r: (r["profit_total"] / r["stake_total"] * 100) if r["stake_total"] > 0 else 0,
-            axis=1,
+        df_banca["roi_cap_pct"] = df_banca["roi_sobre_capital_acum"].apply(
+            lambda x: x * 100 if x is not None else None
         )
-        grp_div_plot = grp_div_plot.sort_values("roi_pct", ascending=False)
 
-        st.markdown("#### ROI por división (%)")
-        st.bar_chart(
-            grp_div_plot.set_index("division")[["roi_pct"]],
+        st.markdown("#### Banca actual en el tiempo")
+        st.line_chart(
+            df_banca.set_index("fecha")[["banca_actual"]],
             use_container_width=True,
         )
+
+        st.markdown("#### ROI sobre banca (%)")
+        st.line_chart(
+            df_banca.set_index("fecha")[["roi_ini_pct", "roi_cap_pct"]],
+            use_container_width=True,
+        )
+    else:
+        st.write("No se ha podido construir la serie de banca (posiblemente faltan movimientos y/o fechas).")
 
 
 # ======================================================================
@@ -744,7 +802,7 @@ def main():
         st.title("Gestión de apuestas – Seguimiento")
         show_gestion()
     else:
-        st.title("Estadísticas de ROI")
+        st.title("Estadísticas de ROI y banca")
         show_stats()
 
 
