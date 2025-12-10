@@ -86,7 +86,7 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
             # Campo 'model_class' (NOT NULL en tu BD)
             "model_class": match_class,
 
-            # Nueva columna: apuesta_real (por defecto NO al registrar desde el modelo)
+            # Por defecto, cuando se registra desde el modelo lo marcamos como NO real
             "apuesta_real": "NO",
         }
 
@@ -170,10 +170,14 @@ def update_seguimiento_from_df(
         if not changes:
             continue  # nada que actualizar en esta fila
 
-        # Forzamos ints en los minutos de cierre y minuto del primer gol
-        for minute_col in ["close_minute_global", "close_minute_1_1", "first_goal_minute"]:
+        # Forzamos ints en los minutos de cierre para evitar problemas de tipos
+        for minute_col in ["close_minute_global", "close_minute_1_1"]:
             if minute_col in changes:
                 changes[minute_col] = _to_int_or_none(changes[minute_col])
+
+        # También normalizamos minuto_primer_gol si viene en cambios
+        if "minuto_primer_gol" in changes:
+            changes["minuto_primer_gol"] = _to_int_or_none(changes["minuto_primer_gol"])
 
         # Ejecutamos update en Supabase
         resp = supabase.table("seguimiento").update(changes).eq("id", int(row_id)).execute()
@@ -190,10 +194,65 @@ def update_seguimiento_row(row_id: int, changes: Dict) -> None:
     Actualiza una sola fila de 'seguimiento' por id, con los campos dados en changes.
     """
     # Normalizamos los campos que deben ser INT
-    for minute_col in ["close_minute_global", "close_minute_1_1", "first_goal_minute"]:
+    for minute_col in ["close_minute_global", "close_minute_1_1", "minuto_primer_gol"]:
         if minute_col in changes:
             changes[minute_col] = _to_int_or_none(changes[minute_col])
 
     resp = supabase.table("seguimiento").update(changes).eq("id", int(row_id)).execute()
     if getattr(resp, "error", None):
         raise RuntimeError(f"Error actualizando id={row_id} en seguimiento: {resp.error}")
+
+
+def compute_and_update_pct_minuto_primer_gol(df: pd.DataFrame) -> int:
+    """
+    Calcula el percentil del minuto_primer_gol entre todos los partidos
+    con pick_type Ideal / Buena filtrada y minuto_primer_gol informado,
+    y lo guarda en la columna pct_minuto_primer_gol de la tabla 'seguimiento'.
+
+    Devuelve el número de filas actualizadas.
+    """
+    if df.empty:
+        return 0
+
+    if "id" not in df.columns or "minuto_primer_gol" not in df.columns:
+        return 0
+
+    # Trabajamos con una copia
+    work = df.copy()
+
+    # Normalizamos minuto_primer_gol a numérico
+    work["minuto_primer_gol"] = pd.to_numeric(
+        work["minuto_primer_gol"],
+        errors="coerce",
+    )
+
+    # Filtramos Ideal + Buena filtrada con minuto_primer_gol válido
+    mask = work["minuto_primer_gol"].notna()
+    if "pick_type" in work.columns:
+        mask &= work["pick_type"].isin(["Ideal", "Buena filtrada"])
+
+    subset = work[mask].copy()
+    if subset.empty:
+        return 0
+
+    # Percentil (0-1) del minuto_primer_gol dentro del subconjunto
+    # rank(pct=True) da valores entre 0 y 1
+    subset["pct"] = subset["minuto_primer_gol"].rank(method="average", pct=True)
+
+    updated = 0
+
+    for _, row in subset.iterrows():
+        row_id = row["id"]
+        pct_val = float(row["pct"])
+
+        resp = supabase.table("seguimiento").update(
+            {"pct_minuto_primer_gol": pct_val}
+        ).eq("id", int(row_id)).execute()
+
+        if getattr(resp, "error", None):
+            raise RuntimeError(
+                f"Error actualizando pct_minuto_primer_gol para id={row_id}: {resp.error}"
+            )
+        updated += 1
+
+    return updated
