@@ -341,7 +341,7 @@ def show_gestion():
     opciones = []
     for _, row in filtered.iterrows():
         etiqueta = (
-            f"ID {row['id']} - {row.get('fecha", '')} - {row.get('division', '')} - "
+            f"ID {row['id']} - {row.get('fecha', '')} - {row.get('division', '')} - "
             f"{row.get('home_team', '')} vs {row.get('away_team', '')}"
         )
         opciones.append((int(row["id"]), etiqueta))
