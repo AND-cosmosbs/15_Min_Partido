@@ -3,7 +3,6 @@
 import os
 import sys
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -25,9 +24,7 @@ from backend.seguimiento import (  # type: ignore
 )
 
 
-# ======================================================================
-# CARGA HISTÓRICO (CACHEADO)
-# ======================================================================
+# ---------- CARGA HISTÓRICO (CACHEADO) ----------
 
 @st.cache_data(show_spinner="Cargando histórico y calculando estadísticas…")
 def _load_hist_and_stats():
@@ -305,8 +302,6 @@ def show_gestion():
         "profit_euros",
         "roi",
         "apuesta_real",
-        "minuto_primer_gol",
-        "pct_minuto_primer_gol",
     ]
 
     # Ordenamos por fecha/hora para que sea más legible
@@ -346,7 +341,7 @@ def show_gestion():
     opciones = []
     for _, row in filtered.iterrows():
         etiqueta = (
-            f"ID {row['id']} - {row.get('fecha', '')} - {row.get('division', '')} - "
+            f"ID {row['id']} - {row.get('fecha", '')} - {row.get('division', '')} - "
             f"{row.get('home_team', '')} vs {row.get('away_team', '')}"
         )
         opciones.append((int(row["id"]), etiqueta))
@@ -422,15 +417,6 @@ def show_gestion():
             step=1.0,
         )
 
-        # Minuto primer gol
-        minuto_primer_gol = st.number_input(
-            "Minuto del primer gol (HT)",
-            value=int(row_sel["minuto_primer_gol"]) if pd.notna(row_sel.get("minuto_primer_gol")) else 0,
-            step=1,
-            min_value=0,
-            max_value=45,
-        )
-
         # ROI calculado automáticamente: profit / suma de stakes
         total_stake = stake_btts_no + stake_u35 + stake_1_1
         if total_stake > 0:
@@ -447,13 +433,6 @@ def show_gestion():
             index=0 if apuesta_real_actual == "SI" else 1,
         )
 
-        # Percentil mostrado (si existe)
-        pct_actual = row_sel.get("pct_minuto_primer_gol")
-        if pd.notna(pct_actual):
-            st.write(f"Percentil minuto primer gol guardado: **{pct_actual:.1f}**")
-        else:
-            st.write("Percentil minuto primer gol guardado: —")
-
         submitted = st.form_submit_button("Guardar cambios (formulario)")
 
         if submitted:
@@ -468,7 +447,6 @@ def show_gestion():
                 "odds_1_1_init": odds_1_1_init,
                 "profit_euros": profit_euros,
                 "apuesta_real": apuesta_real,
-                "minuto_primer_gol": minuto_primer_gol if minuto_primer_gol > 0 else None,
             }
 
             # Solo enviamos ROI si se ha podido calcular
@@ -548,7 +526,7 @@ def show_stats():
         st.metric("Total stake (€)", f"{total_stake_sum:,.2f}")
     with col3:
         if roi_global is not None:
-            st.metric("ROI global", f"{roi_global*100:.2f} %")
+            st.metric("ROI global", f"{roi_global:.3f}")
         else:
             st.metric("ROI global", "—")
 
@@ -567,7 +545,6 @@ def show_stats():
             lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else None,
             axis=1,
         )
-        grp_ar["roi_pct"] = grp_ar["roi"] * 100
         st.dataframe(grp_ar, use_container_width=True)
     else:
         st.write("No existe columna 'apuesta_real' en los datos.")
@@ -588,7 +565,6 @@ def show_stats():
             lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else None,
             axis=1,
         )
-        grp_div["roi_pct"] = grp_div["roi"] * 100
         st.dataframe(grp_div.sort_values("roi", ascending=False), use_container_width=True)
     else:
         st.write("No existe columna 'division' en los datos.")
@@ -609,7 +585,6 @@ def show_stats():
             lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else None,
             axis=1,
         )
-        grp_pick["roi_pct"] = grp_pick["roi"] * 100
         st.dataframe(grp_pick.sort_values("roi", ascending=False), use_container_width=True)
     else:
         st.write("No existe columna 'pick_type' en los datos.")
@@ -628,7 +603,7 @@ def show_stats():
             axis=1,
         )
 
-        st.markdown("#### ROI acumulado en el tiempo (sobre importe apostado)")
+        st.markdown("#### ROI acumulado en el tiempo")
         st.line_chart(
             df_time.set_index("fecha")[["roi_acum"]],
             use_container_width=True,
@@ -639,6 +614,7 @@ def show_stats():
     # ROI por división (barras)
     if "division" in df.columns:
         st.markdown("#### ROI por división (barras)")
+
         grp_div_plot = (
             df.groupby("division")
             .apply(lambda g: pd.Series({
@@ -651,19 +627,20 @@ def show_stats():
             lambda r: r["profit_total"] / r["stake_total"] if r["stake_total"] > 0 else 0,
             axis=1,
         )
-        grp_div_plot["roi_pct"] = grp_div_plot["roi"] * 100
+        grp_div_plot = grp_div_plot.sort_values("roi", ascending=False)
+
         st.bar_chart(
-            grp_div_plot.set_index("division")[["roi_pct"]],
+            grp_div_plot.set_index("division")[["roi"]],
             use_container_width=True,
         )
 
 
 # ======================================================================
-# VISTA: SUPERVIVENCIA & CONVEXIDAD
+# VISTA: SUPERVIVENCIA & CONVEXIDAD (CON PERCENTILES)
 # ======================================================================
 
 def show_supervivencia_convexidad():
-    st.markdown("### Supervivencia & Convexidad")
+    st.markdown("### Supervivencia & Convexidad – Minuto del primer gol")
 
     try:
         df = fetch_seguimiento()
@@ -672,19 +649,21 @@ def show_supervivencia_convexidad():
         return
 
     if df.empty:
-        st.info("Todavía no hay registros en 'seguimiento'.")
+        st.info("Todavía no hay datos en 'seguimiento'.")
         return
 
-    # Normalizamos fecha
+    # Normalizamos fecha y minuto_primer_gol
     if "fecha" in df.columns:
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
 
-    # Aseguramos tipos numéricos
-    if "minuto_primer_gol" in df.columns:
-        df["minuto_primer_gol"] = pd.to_numeric(df["minuto_primer_gol"], errors="coerce")
+    if "minuto_primer_gol" not in df.columns:
+        st.warning("La tabla 'seguimiento' no tiene la columna 'minuto_primer_gol'. Añádela para poder analizar supervivencia.")
+        return
 
-    # ----------------- FILTROS BÁSICOS -----------------
-    with st.expander("Filtros para análisis de supervivencia"):
+    df["minuto_primer_gol"] = pd.to_numeric(df["minuto_primer_gol"], errors="coerce")
+
+    # ----------------- FILTROS -----------------
+    with st.expander("Filtros"):
         # Rango de fechas
         if "fecha" in df.columns and df["fecha"].notna().any():
             min_date = df["fecha"].min().date()
@@ -696,7 +675,7 @@ def show_supervivencia_convexidad():
         else:
             fecha_desde, fecha_hasta = None, None
 
-        # División
+        # Filtro por división
         divisiones = sorted([x for x in df.get("division", pd.Series()).dropna().unique()])
         if divisiones:
             div_filter = st.multiselect(
@@ -707,7 +686,7 @@ def show_supervivencia_convexidad():
         else:
             div_filter = []
 
-        # PickType
+        # Filtro por PickType
         pick_types = sorted([x for x in df.get("pick_type", pd.Series()).dropna().unique()])
         if pick_types:
             pick_filter = st.multiselect(
@@ -718,7 +697,7 @@ def show_supervivencia_convexidad():
         else:
             pick_filter = []
 
-        # Apuesta real
+        # Filtro por apuesta_real
         if "apuesta_real" in df.columns:
             ar_values = sorted([x for x in df["apuesta_real"].dropna().unique()])
             if ar_values:
@@ -732,7 +711,6 @@ def show_supervivencia_convexidad():
         else:
             apuesta_real_filter = []
 
-    # Aplicamos filtros
     mask = pd.Series(True, index=df.index)
 
     if fecha_desde is not None and "fecha" in df.columns:
@@ -750,102 +728,139 @@ def show_supervivencia_convexidad():
     df_filt = df[mask].copy()
 
     if df_filt.empty:
-        st.warning("No hay registros que cumplan los filtros para supervivencia.")
+        st.warning("No hay registros que cumplan los filtros.")
         return
 
-    # ================= SUPERVIVENCIA =================
-    st.markdown("#### Curva de supervivencia (probabilidad de llegar sin gol hasta t)")
+    st.write(f"Partidos considerados: **{len(df_filt)}**")
 
-    if "minuto_primer_gol" not in df_filt.columns:
-        st.warning("No existe la columna 'minuto_primer_gol' en la tabla 'seguimiento'.")
-    else:
-        m = df_filt["minuto_primer_gol"]
+    # ================== CURVA DE SUPERVIVENCIA ==================
 
-        minutos = list(range(0, 46))
-        surv = []
-        for t in minutos:
-            # Consideramos sin gol (NaN) como > 45 (censura a 45')
-            surv.append(((m.isna()) | (m > t)).mean())
+    # Consideramos HT: si no hay gol (NaN) lo tratamos como > 45
+    minutos = df_filt["minuto_primer_gol"].copy()
+    sin_gol_mask = minutos.isna()
+    total = len(df_filt)
 
-        surv_df = pd.DataFrame({"minuto": minutos, "supervivencia": surv})
-        st.line_chart(surv_df.set_index("minuto"), use_container_width=True)
+    grid = list(range(0, 46))  # 0 a 45
+    supervivencia = []
+
+    for m in grid:
+        vivos = ((minutos > m) | sin_gol_mask).sum()
+        supervivencia.append(vivos / total if total > 0 else 0.0)
+
+    surv_df = pd.DataFrame({
+        "minuto": grid,
+        "supervivencia": supervivencia,
+    })
+
+    st.markdown("#### Curva de supervivencia (probabilidad de NO haber encajado gol HT)")
+
+    st.line_chart(
+        surv_df.set_index("minuto")[["supervivencia"]],
+        use_container_width=True,
+    )
+
+    # "Zona de confort": por ejemplo donde supervivencia ≥ 0.80
+    zona_80 = [m for m, s in zip(grid, supervivencia) if s >= 0.80]
+    if zona_80:
+        inicio_80 = min(zona_80)
+        fin_80 = max(zona_80)
+        st.info(
+            f"En esta muestra, la probabilidad de llegar sin gol es ≥ 80% entre los minutos "
+            f"{inicio_80} y {fin_80}."
+        )
+
+    # ================== DISTRIBUCIÓN MINUTO PRIMER GOL ==================
 
     st.markdown("#### Distribución del minuto del primer gol (bloques de 5 minutos)")
 
-    if "minuto_primer_gol" in df_filt.columns:
-        df_goals = df_filt[df_filt["minuto_primer_gol"].notna()].copy()
+    # Solo partidos con gol
+    con_gol = df_filt[df_filt["minuto_primer_gol"].notna()].copy()
+    con_gol = con_gol[con_gol["minuto_primer_gol"] <= 45]
 
-        if df_goals.empty:
-            st.info("No hay registros con 'minuto_primer_gol' informado.")
-        else:
-            # Bins de 5 minutos: 0-5, 5-10, ..., 40-45
-            bins = np.arange(0, 50, 5)  # 0,5,10,...45
-            df_goals["bloque_5m"] = pd.cut(
-                df_goals["minuto_primer_gol"],
-                bins=bins,
-                right=True,
-                include_lowest=True,
+    if con_gol.empty:
+        st.warning("No hay datos de minuto_primer_gol dentro de la primera parte.")
+    else:
+        bins = list(range(0, 50, 5))  # 0-5,5-10,...,45-50
+        labels = [f"{bins[i]}–{bins[i+1]}" for i in range(len(bins) - 1)]
+
+        con_gol["bloque_5m"] = pd.cut(
+            con_gol["minuto_primer_gol"],
+            bins=bins,
+            labels=labels,
+            include_lowest=True,
+            right=True,
+        )
+
+        distrib_df = (
+            con_gol.groupby("bloque_5m")
+            .size()
+            .reset_index(name="n_partidos")
+        )
+
+        # Convertimos a string para que Streamlit no se queje de los Interval
+        distrib_df["bloque_5m"] = distrib_df["bloque_5m"].astype(str)
+
+        # Añadimos explícitamente los partidos sin gol HT, si existen
+        n_sin_gol = df_filt["minuto_primer_gol"].isna().sum()
+        if n_sin_gol > 0:
+            distrib_df = pd.concat(
+                [
+                    distrib_df,
+                    pd.DataFrame({"bloque_5m": ["sin gol HT"], "n_partidos": [n_sin_gol]}),
+                ],
+                ignore_index=True,
             )
 
-            distrib_df = (
-                df_goals.groupby("bloque_5m")
-                .size()
-                .reset_index(name="n_partidos")
-            )
+        st.bar_chart(
+            distrib_df.set_index("bloque_5m")[["n_partidos"]],
+            use_container_width=True,
+        )
 
-            # --- FIX: convertir Interval a string para Streamlit ---
-            distrib_df["bloque_5m_label"] = distrib_df["bloque_5m"].astype(str)
+    # ================== PERCENTILES DEL MINUTO PRIMER GOL ==================
 
-            st.dataframe(distrib_df, use_container_width=True)
+    st.markdown("#### Percentiles del minuto del primer gol (HT)")
 
-            st.bar_chart(
-                distrib_df.set_index("bloque_5m_label")[["n_partidos"]],
-                use_container_width=True,
-            )
+    serie_goles = df_filt["minuto_primer_gol"].dropna()
+    serie_goles = serie_goles[serie_goles <= 45]
 
-    # ================= PERCENTIL MINUTO PRIMER GOL =================
+    if serie_goles.empty:
+        st.write("No hay suficientes datos de minuto_primer_gol para calcular percentiles.")
+    else:
+        percentiles = {
+            "P10": serie_goles.quantile(0.10),
+            "P25": serie_goles.quantile(0.25),
+            "P50 (mediana)": serie_goles.quantile(0.50),
+            "P75": serie_goles.quantile(0.75),
+            "P90": serie_goles.quantile(0.90),
+        }
 
-    st.markdown("#### Percentil del minuto del primer gol")
+        pct_table = pd.DataFrame(
+            {
+                "Percentil": list(percentiles.keys()),
+                "Minuto_primer_gol": [round(v, 2) for v in percentiles.values()],
+            }
+        )
+        st.table(pct_table)
 
-    if "minuto_primer_gol" in df_filt.columns:
-        df_pct = df_filt[df_filt["minuto_primer_gol"].notna()].copy()
+        st.info(
+            "Interpretación rápida:\n"
+            f"- En esta muestra, el 10% de los goles HT llegan antes del minuto ~{percentiles['P10']:.1f}.\n"
+            f"- El 50% (mediana) llegan antes del minuto ~{percentiles['P50 (mediana)']:.1f}.\n"
+            f"- El 90% llegan antes del minuto ~{percentiles['P90']:.1f}."
+        )
 
-        if df_pct.empty:
-            st.info("No hay registros con minuto_primer_gol para calcular percentiles.")
-        else:
-            # Aseguramos existencia de columna pct_minuto_primer_gol
-            if "pct_minuto_primer_gol" not in df_pct.columns:
-                df_pct["pct_minuto_primer_gol"] = np.nan
+        # Percentil por partido dentro del subset filtrado (solo en memoria)
+        ranks = serie_goles.rank(pct=True) * 100.0  # 0-100
+        df_filt["pct_minuto_primer_gol"] = df_filt["minuto_primer_gol"].map(ranks)
 
-            # Percentil empírico dentro del subconjunto filtrado
-            df_pct["pct_calc"] = df_pct["minuto_primer_gol"].rank(pct=True) * 100
+        st.markdown("##### Ejemplos de partidos con su percentil de minuto_primer_gol")
 
-            st.dataframe(
-                df_pct[["id", "fecha", "division", "home_team", "away_team",
-                        "minuto_primer_gol", "pct_minuto_primer_gol", "pct_calc"]],
-                use_container_width=True,
-            )
+        muestra = df_filt[
+            df_filt["minuto_primer_gol"].notna()
+        ][["fecha", "division", "home_team", "away_team", "minuto_primer_gol", "pct_minuto_primer_gol"]].copy()
 
-            if st.button("Guardar percentiles calculados en Supabase"):
-                n_updates = 0
-                for _, row in df_pct.iterrows():
-                    row_id = int(row["id"])
-                    pct_guardado = row.get("pct_minuto_primer_gol")
-                    pct_nuevo = row.get("pct_calc")
-
-                    if pd.isna(pct_nuevo):
-                        continue
-
-                    # Solo actualizamos si no hay valor guardado o es distinto
-                    if pd.isna(pct_guardado) or abs(pct_guardado - pct_nuevo) > 1e-6:
-                        try:
-                            update_seguimiento_row(row_id, {"pct_minuto_primer_gol": float(pct_nuevo)})
-                            n_updates += 1
-                        except Exception as e:
-                            st.error(f"Error actualizando percentil para id={row_id}: {e}")
-                            break
-
-                st.success(f"Percentiles actualizados para {n_updates} registros.")
+        muestra = muestra.sort_values("minuto_primer_gol").head(10)
+        st.dataframe(muestra, use_container_width=True)
 
 
 # ======================================================================
