@@ -29,6 +29,11 @@ def _to_float_or_none(value):
 def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
     """
     Inserta en la tabla 'seguimiento' las filas de picks_df.
+
+    picks_df debe contener al menos:
+      - Date, Time, Div, HomeTeam, AwayTeam
+      - B365H, B365D, B365A
+      - L_score, H_T_score, A_T_score, MatchScore, MatchClass, PickType (PickType puede venir vacío)
     """
 
     if picks_df.empty:
@@ -51,62 +56,61 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
         if "Time" in r and pd.notna(r["Time"]):
             hora = str(r["Time"])
 
-        # Campos INT: los forzamos a int o None
+        # Scores INT
         l_score = _to_int_or_none(r.get("L_score"))
         h_t_score = _to_int_or_none(r.get("H_T_score"))
         a_t_score = _to_int_or_none(r.get("A_T_score"))
         match_score = _to_int_or_none(r.get("MatchScore"))
 
-        match_class = r.get("MatchClass")
-        pick_type = r.get("PickType")
+        match_class = r.get("MatchClass")  # Ideal / Buena / Borderline / Descartar
+        pick_type_raw = r.get("PickType")  # Ideal / Buena filtrada (a veces vacío)
+        pick_type = pick_type_raw if (pick_type_raw is not None and str(pick_type_raw).strip() != "" and pd.notna(pick_type_raw)) else match_class
 
-        # Estrategia (si viene del selector)
-        estrategia = r.get("Estrategia")
-        if estrategia not in ["Convexidad", "Spread Attack"]:
-            estrategia = "Convexidad"
+        # Fallback final por si también viniera vacío
+        if pick_type is None or (isinstance(pick_type, str) and pick_type.strip() == "") or pd.isna(pick_type):
+            pick_type = "Buena"
+
+        # Cuotas iniciales numéricas (si vienen como texto, también las acepta)
+        b365h = _to_float_or_none(r.get("B365H"))
+        b365d = _to_float_or_none(r.get("B365D"))
+        b365a = _to_float_or_none(r.get("B365A"))
 
         rec: Dict = {
             "fecha": fecha_str,
             "hora": hora,
 
-            # En tu BD tienes 'division' y también 'div' (NOT NULL en tu caso)
+            # En tu BD existen 'division' y 'div' (NOT NULL)
             "division": r.get("Div"),
             "div": r.get("Div"),
 
             "home_team": r.get("HomeTeam"),
             "away_team": r.get("AwayTeam"),
 
-            # Cuotas iniciales (1X2)
-            "b365h": _to_float_or_none(r.get("B365H")),
-            "b365d": _to_float_or_none(r.get("B365D")),
-            "b365a": _to_float_or_none(r.get("B365A")),
+            "b365h": b365h,
+            "b365d": b365d,
+            "b365a": b365a,
 
-            # Scores del modelo (INT en la BD)
             "l_score": l_score,
             "h_t_score": h_t_score,
             "a_t_score": a_t_score,
             "match_score": match_score,
 
-            # Clasificación del modelo
             "match_class": match_class,
             "pick_type": pick_type,
 
-            # Campo 'model_class' (NOT NULL en tu BD)
-            "model_class": match_class,
+            # model_class NOT NULL en tu BD (por tu histórico de cambios)
+            "model_class": match_class if match_class is not None and str(match_class).strip() != "" else pick_type,
 
-            # Por defecto
+            # por defecto
             "apuesta_real": "NO",
-        }
 
-        # Si existen estas columnas en tu BD, las guardamos (si no existen, Supabase ignora? No: daría error).
-        # Para no romper: SOLO las enviamos si vienen en el DF y no están vacías.
-        # Aun así, lo mejor es que ya hayas creado las columnas en Supabase antes.
-        rec["estrategia"] = estrategia
+            # NUEVO: estrategia (la podrás cambiar luego en el formulario)
+            "estrategia": "Convexidad",
+        }
 
         records.append(rec)
 
     resp = supabase.table("seguimiento").insert(records).execute()
-
     if getattr(resp, "error", None):
         raise RuntimeError(f"Error insertando en seguimiento: {resp.error}")
 
@@ -114,10 +118,8 @@ def insert_seguimiento_from_picks(picks_df: pd.DataFrame) -> None:
 def fetch_seguimiento() -> pd.DataFrame:
     """Devuelve toda la tabla 'seguimiento' como DataFrame."""
     resp = supabase.table("seguimiento").select("*").execute()
-
     if getattr(resp, "error", None):
         raise RuntimeError(f"Error leyendo seguimiento: {resp.error}")
-
     data = getattr(resp, "data", None) or []
     return pd.DataFrame(data)
 
@@ -128,9 +130,9 @@ def update_seguimiento_from_df(
     editable_cols: List[str],
 ) -> int:
     """
-    Actualiza la tabla 'seguimiento' comparando original_df y edited_df.
+    Actualiza 'seguimiento' comparando original_df y edited_df.
+    Devuelve número de filas actualizadas.
     """
-
     if "id" not in original_df.columns or "id" not in edited_df.columns:
         raise ValueError("Ambos DataFrames deben tener columna 'id'.")
 
@@ -170,19 +172,14 @@ def update_seguimiento_from_df(
         if not changes:
             continue
 
-        # Forzar ints
+        # Normalizar ints para minutos
         for minute_col in ["close_minute_global", "close_minute_1_1", "minuto_primer_gol"]:
             if minute_col in changes:
                 changes[minute_col] = _to_int_or_none(changes[minute_col])
 
-        # Forzar floats
-        for float_col in [
-            "stake_btts_no", "stake_u35", "stake_1_1",
-            "odds_btts_no_init", "odds_u35_init", "odds_1_1_init",
-            "profit_euros", "roi", "raroc", "pct_minuto_primer_gol"
-        ]:
-            if float_col in changes:
-                changes[float_col] = _to_float_or_none(changes[float_col])
+        # RAROC numérico si viene
+        if "raroc" in changes:
+            changes["raroc"] = _to_float_or_none(changes["raroc"])
 
         resp = supabase.table("seguimiento").update(changes).eq("id", int(row_id)).execute()
         if getattr(resp, "error", None):
@@ -194,19 +191,13 @@ def update_seguimiento_from_df(
 
 
 def update_seguimiento_row(row_id: int, changes: Dict) -> None:
-    """Actualiza una sola fila de 'seguimiento' por id, con los campos dados en changes."""
-
+    """Actualiza una sola fila por id."""
     for minute_col in ["close_minute_global", "close_minute_1_1", "minuto_primer_gol"]:
         if minute_col in changes:
             changes[minute_col] = _to_int_or_none(changes[minute_col])
 
-    for float_col in [
-        "stake_btts_no", "stake_u35", "stake_1_1",
-        "odds_btts_no_init", "odds_u35_init", "odds_1_1_init",
-        "profit_euros", "roi", "raroc", "pct_minuto_primer_gol"
-    ]:
-        if float_col in changes:
-            changes[float_col] = _to_float_or_none(changes[float_col])
+    if "raroc" in changes:
+        changes["raroc"] = _to_float_or_none(changes["raroc"])
 
     resp = supabase.table("seguimiento").update(changes).eq("id", int(row_id)).execute()
     if getattr(resp, "error", None):
@@ -215,8 +206,8 @@ def update_seguimiento_row(row_id: int, changes: Dict) -> None:
 
 def compute_and_update_pct_minuto_primer_gol(df: pd.DataFrame) -> int:
     """
-    Calcula pct_minuto_primer_gol (0..1) para partidos Ideal/Buena filtrada con minuto_primer_gol informado,
-    y lo guarda en la columna pct_minuto_primer_gol.
+    Calcula percentil del minuto_primer_gol para Ideal/Buena filtrada, y guarda
+    en 'pct_minuto_primer_gol' (ya existe en tu BD según tu hilo).
     """
     if df.empty:
         return 0
@@ -246,9 +237,8 @@ def compute_and_update_pct_minuto_primer_gol(df: pd.DataFrame) -> int:
         ).eq("id", int(row_id)).execute()
 
         if getattr(resp, "error", None):
-            raise RuntimeError(
-                f"Error actualizando pct_minuto_primer_gol para id={row_id}: {resp.error}"
-            )
+            raise RuntimeError(f"Error actualizando pct_minuto_primer_gol para id={row_id}: {resp.error}")
+
         updated += 1
 
     return updated
