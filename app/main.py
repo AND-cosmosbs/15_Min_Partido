@@ -615,7 +615,11 @@ def show_banca():
         with c2:
             tipo = st.selectbox("Tipo", options=["DEPOSITO", "RETIRADA", "AJUSTE"])
         with c3:
-            importe = st.number_input("Importe", min_value=0.0, step=10.0, value=0.0)
+            # ✅ CAMBIO: permitir negativos SOLO si tipo == AJUSTE
+            if tipo == "AJUSTE":
+                importe = st.number_input("Importe", min_value=-1_000_000_000.0, step=10.0, value=0.0)
+            else:
+                importe = st.number_input("Importe", min_value=0.0, step=10.0, value=0.0)
 
         comentario = st.text_input("Comentario (opcional)", value="")
         submitted = st.form_submit_button("Guardar movimiento")
