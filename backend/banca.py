@@ -39,15 +39,36 @@ def insert_banca_movimiento(
 
     tipo: 'DEPOSITO', 'RETIRADA', 'AJUSTE'
     fecha: date o string 'YYYY-MM-DD'
-    importe: número positivo (el signo se gestiona por tipo)
+
+    Reglas:
+    - DEPOSITO: importe debe ser > 0
+    - RETIRADA: importe debe ser > 0
+    - AJUSTE: importe puede ser positivo o negativo (para corregir la banca)
     """
     if not tipo:
         raise ValueError("tipo es obligatorio (DEPOSITO / RETIRADA / AJUSTE)")
 
+    tipo = str(tipo).strip().upper()
+    if tipo not in {"DEPOSITO", "RETIRADA", "AJUSTE"}:
+        raise ValueError("tipo inválido. Usa: DEPOSITO / RETIRADA / AJUSTE")
+
+    try:
+        imp = float(importe)
+    except Exception:
+        raise ValueError("importe debe ser numérico")
+
+    # ✅ Permitimos negativo SOLO en AJUSTE
+    if tipo in {"DEPOSITO", "RETIRADA"}:
+        if imp <= 0:
+            raise ValueError("En DEPOSITO/RETIRADA el importe debe ser > 0")
+    else:  # AJUSTE
+        if imp == 0:
+            raise ValueError("En AJUSTE, el importe no puede ser 0 (usa + o - para ajustar)")
+
     rec = {
         "fecha": str(fecha),
         "tipo": tipo,
-        "importe": float(importe),
+        "importe": imp,  # tal cual; en AJUSTE puede ser negativo
         "comentario": comentario,
     }
 
