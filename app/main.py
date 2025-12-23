@@ -137,7 +137,6 @@ def _compute_equity_curve(
         .rename(columns={"profit_euros": "profit"})
     )
 
-    # calendario conjunto
     fechas = pd.Series(pd.concat([
         mov_daily.get("fecha", pd.Series(dtype="object")),
         profit_daily.get("fecha", pd.Series(dtype="object")),
@@ -155,7 +154,6 @@ def _compute_equity_curve(
     cal["profit_cum"] = cal["profit"].cumsum()
     cal["equity"] = cal["mov_cum"] + cal["profit_cum"]
 
-    # drawdown
     cal["peak"] = cal["equity"].cummax()
     cal["drawdown_abs"] = cal["equity"] - cal["peak"]
     cal["drawdown_pct"] = pd.NA
@@ -206,7 +204,6 @@ def show_selector():
         st.error(f"Error aplicando el modelo a los fixtures: {e}")
         return
 
-    # ✅ Mostrar también "Buena" (además de Ideal y Buena filtrada)
     picks = scored[
         scored["MatchClass"].isin(["Ideal", "Buena", "Buena filtrada"])
         | scored["PickType"].notna()
@@ -356,7 +353,6 @@ def show_gestion():
 
     st.write(f"Registros filtrados: **{len(filtered)}**")
 
-    # columnas editables (solo las que existan realmente en DF)
     base_editable = [
         "stake_btts_no", "stake_u35", "stake_1_1",
         "close_minute_global", "close_minute_1_1",
@@ -414,7 +410,6 @@ def show_gestion():
             f"({row_sel.get('division', '')}, {row_sel.get('fecha', '')}, {row_sel.get('hora', '')})"
         )
 
-        # estrategia (si existe)
         estrategia = None
         if "estrategia" in filtered.columns:
             estrategia_actual = (row_sel.get("estrategia") or "Convexidad")
@@ -437,7 +432,6 @@ def show_gestion():
 
         profit_euros = st.number_input("Profit (€)", value=float(row_sel.get("profit_euros", 0) or 0), step=1.0)
 
-        # minuto primer gol
         minuto_primer_gol_actual = row_sel.get("minuto_primer_gol")
         if pd.isna(minuto_primer_gol_actual):
             minuto_primer_gol_actual = 0
@@ -450,7 +444,6 @@ def show_gestion():
         )
         sin_gol = st.checkbox("No hubo gol (guardar NULL)", value=pd.isna(row_sel.get("minuto_primer_gol")))
 
-        # ROI calculado automáticamente
         total_stake = stake_btts_no + stake_u35 + stake_1_1
         if total_stake > 0:
             roi_calc = profit_euros / total_stake
@@ -459,12 +452,11 @@ def show_gestion():
             roi_calc = None
             st.write("ROI calculado: — (faltan stakes o profit)")
 
-        # RAROC usando close_minute_global
         raroc_calc = None
         raroc_pct_calc = None
         if roi_calc is not None and close_minute_global and close_minute_global > 0:
-            raroc_calc = float(roi_calc) / float(close_minute_global)        # decimal por minuto
-            raroc_pct_calc = raroc_calc * 100.0                               # % por minuto
+            raroc_calc = float(roi_calc) / float(close_minute_global)
+            raroc_pct_calc = raroc_calc * 100.0
             st.write(f"RAROC: **{raroc_pct_calc:.4f}% por minuto**")
         else:
             st.write("RAROC: — (necesita ROI y close_minute_global > 0).")
@@ -492,8 +484,6 @@ def show_gestion():
 
             if estrategia is not None and "estrategia" in filtered.columns:
                 cambios["estrategia"] = estrategia
-
-            # solo guardar raroc/raroc_pct si existen en tabla
             if "raroc" in filtered.columns:
                 cambios["raroc"] = raroc_calc
             if "raroc_pct" in filtered.columns:
@@ -592,34 +582,38 @@ def show_stats():
 def show_banca():
     st.markdown("### Banca – equity, ROI sobre banca y Maximum Drawdown")
 
-    # cargar movimientos
     try:
         mov = fetch_banca_movimientos()
     except Exception as e:
         st.error(f"Error cargando banca_movimientos: {e}")
         return
 
-    # cargar seguimiento (para sumar profits)
     try:
         seg = fetch_seguimiento()
     except Exception as e:
         st.error(f"Error cargando seguimiento: {e}")
         return
 
-    # UI: añadir movimiento
+    # ✅ IMPORTANTE: 'tipo' FUERA del form para poder cambiar min_value del importe
     st.markdown("#### Añadir movimiento")
+    tipo = st.selectbox("Tipo", options=["DEPOSITO", "RETIRADA", "AJUSTE"], key="banca_tipo_select")
+
+    # min_value dinámico
+    min_importe = -1e9 if tipo == "AJUSTE" else 0.0
+    help_importe = "En AJUSTE puedes poner negativo (baja banca) o positivo (sube banca)." if tipo == "AJUSTE" else "Introduce el importe (positivo)."
+
     with st.form("form_banca_mov"):
-        c1, c2, c3 = st.columns([1, 1, 2])
+        c1, c2 = st.columns([1, 2])
         with c1:
             fecha = st.date_input("Fecha", value=pd.Timestamp.today().date())
         with c2:
-            tipo = st.selectbox("Tipo", options=["DEPOSITO", "RETIRADA", "AJUSTE"])
-        with c3:
-            # ✅ CAMBIO: permitir negativos SOLO si tipo == AJUSTE
-            if tipo == "AJUSTE":
-                importe = st.number_input("Importe", min_value=-1_000_000_000.0, step=10.0, value=0.0)
-            else:
-                importe = st.number_input("Importe", min_value=0.0, step=10.0, value=0.0)
+            importe = st.number_input(
+                "Importe",
+                min_value=float(min_importe),
+                step=10.0,
+                value=0.0,
+                help=help_importe,
+            )
 
         comentario = st.text_input("Comentario (opcional)", value="")
         submitted = st.form_submit_button("Guardar movimiento")
@@ -643,7 +637,6 @@ def show_banca():
         st.info("No hay movimientos todavía. Inserta al menos el **depósito inicial** para poder calcular la banca.")
         return
 
-    # filtros de equity
     st.markdown("#### Configuración")
     only_real = st.checkbox("Usar solo apuestas reales (apuesta_real = SI) para el equity", value=True)
 
@@ -652,17 +645,15 @@ def show_banca():
         st.info("No hay fechas suficientes (movimientos o profits con fecha).")
         return
 
-    # banca inicial = equity del primer día del calendario
     banca_inicial = float(equity_df.iloc[0]["equity"]) if len(equity_df) > 0 else 0.0
     banca_actual = float(equity_df.iloc[-1]["equity"]) if len(equity_df) > 0 else 0.0
 
     total_profit = float(equity_df.iloc[-1]["profit_cum"]) if "profit_cum" in equity_df.columns else 0.0
     roi_banca = (total_profit / banca_inicial) if banca_inicial > 0 else None
 
-    # max drawdown
     mdd_pct = None
     if "drawdown_pct" in equity_df.columns and equity_df["drawdown_pct"].notna().any():
-        mdd_pct = float(equity_df["drawdown_pct"].min())  # negativo
+        mdd_pct = float(equity_df["drawdown_pct"].min())
     mdd_abs = None
     if "drawdown_abs" in equity_df.columns and equity_df["drawdown_abs"].notna().any():
         mdd_abs = float(equity_df["drawdown_abs"].min())
@@ -767,7 +758,6 @@ def show_supervivencia_convexidad():
 
     st.write(f"Partidos considerados: **{len(df_filt)}**")
 
-    # -------- supervivencia HT --------
     minutos = df_filt["minuto_primer_gol"].copy()
     sin_gol_mask = minutos.isna()
     total = len(df_filt)
@@ -783,7 +773,6 @@ def show_supervivencia_convexidad():
     st.markdown("#### Curva de supervivencia (P[sin gol hasta minuto m], 1ª parte)")
     st.line_chart(surv_df.set_index("minuto")[["supervivencia"]], use_container_width=True)
 
-    # -------- distribución minuto primer gol --------
     st.markdown("#### Distribución del minuto del primer gol (bloques de 5 minutos)")
     con_gol = df_filt[df_filt["minuto_primer_gol"].notna()].copy()
     con_gol = con_gol[con_gol["minuto_primer_gol"] <= 45]
@@ -813,7 +802,6 @@ def show_supervivencia_convexidad():
 
         st.bar_chart(distrib_df.set_index("bloque_5m")[["n_partidos"]], use_container_width=True)
 
-    # -------- percentiles --------
     st.markdown("#### Percentiles del minuto del primer gol (HT)")
     serie_goles = df_filt["minuto_primer_gol"].dropna()
     serie_goles = serie_goles[serie_goles <= 45]
@@ -831,7 +819,6 @@ def show_supervivencia_convexidad():
         pct_table = pd.DataFrame({"Percentil": list(percentiles.keys()), "Minuto": [round(v, 2) for v in percentiles.values()]})
         st.table(pct_table)
 
-    # -------- RAROC charts --------
     st.markdown("---")
     st.markdown("### RAROC (visualización)")
 
@@ -842,13 +829,11 @@ def show_supervivencia_convexidad():
     work["total_stake"] = _compute_total_stake(work)
     work["roi_calc"] = _compute_roi_calc(work)
 
-    # si raroc_pct no existe o viene vacío, lo calculamos en memoria
     if "raroc_pct" not in work.columns or work["raroc_pct"].isna().all():
         work = _compute_raroc(work)
     else:
         _safe_numeric(work, "raroc_pct")
 
-    # gráfico por fecha: media raroc_pct
     if "fecha" in work.columns and work["fecha"].notna().any():
         tmp = work.dropna(subset=["fecha"]).copy()
         tmp["fecha_d"] = pd.to_datetime(tmp["fecha"], errors="coerce").dt.date
@@ -861,7 +846,6 @@ def show_supervivencia_convexidad():
         else:
             st.info("No hay RAROC válido (necesita ROI y close_minute_global > 0).")
 
-    # barras por estrategia
     if "estrategia" in work.columns:
         tmp2 = work[work["raroc_pct"].notna()].copy()
         if not tmp2.empty:
