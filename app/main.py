@@ -44,6 +44,16 @@ def _safe_numeric(df: pd.DataFrame, col: str) -> None:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
 
+def _safe_int_default(value, default: int = 0) -> int:
+    """Convierte a int de forma segura (NaN/None -> default)."""
+    if value is None or pd.isna(value):
+        return default
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
 def _compute_total_stake(df: pd.DataFrame) -> pd.Series:
     return (
         df.get("stake_btts_no", 0).fillna(0)
@@ -55,8 +65,9 @@ def _compute_total_stake(df: pd.DataFrame) -> pd.Series:
 def _compute_roi_calc(df: pd.DataFrame) -> pd.Series:
     total_stake = _compute_total_stake(df)
     roi = pd.Series(pd.NA, index=df.index, dtype="object")
-    ok = (total_stake > 0) & df.get("profit_euros", pd.Series(index=df.index)).notna()
-    roi.loc[ok] = df.loc[ok, "profit_euros"] / total_stake.loc[ok]
+    profit = df.get("profit_euros", pd.Series(index=df.index))
+    ok = (total_stake > 0) & profit.notna()
+    roi.loc[ok] = profit.loc[ok] / total_stake.loc[ok]
     return roi
 
 
@@ -86,7 +97,7 @@ def _banca_sign(tipo: str, importe: float) -> float:
         return abs(importe)
     if t == "RETIRADA":
         return -abs(importe)
-    # AJUSTE: permitimos signo tal cual (si metes -100, baja; si metes 100, sube)
+    # AJUSTE: permitimos signo tal cual
     return float(importe)
 
 
@@ -204,6 +215,7 @@ def show_selector():
         st.error(f"Error aplicando el modelo a los fixtures: {e}")
         return
 
+    # Mostrar también "Buena" (además de Ideal y Buena filtrada)
     picks = scored[
         scored["MatchClass"].isin(["Ideal", "Buena", "Buena filtrada"])
         | scored["PickType"].notna()
@@ -216,21 +228,10 @@ def show_selector():
         return
 
     cols_to_show = [
-        "Date",
-        "Time",
-        "Div",
-        "HomeTeam",
-        "AwayTeam",
-        "B365H",
-        "B365D",
-        "B365A",
-        "L_score",
-        "LeagueTier",
-        "H_T_score",
-        "A_T_score",
-        "MatchScore",
-        "MatchClass",
-        "PickType",
+        "Date", "Time", "Div", "HomeTeam", "AwayTeam",
+        "B365H", "B365D", "B365A",
+        "L_score", "LeagueTier", "H_T_score", "A_T_score",
+        "MatchScore", "MatchClass", "PickType",
     ]
 
     base_table = picks[cols_to_show].sort_values(["Date", "Time", "Div", "HomeTeam"]).copy()
@@ -404,6 +405,7 @@ def show_gestion():
     selected_id = ids[seleccion]
     row_sel = filtered[filtered["id"] == selected_id].iloc[0]
 
+    # ✅ FORM SIEMPRE con submit (evita “Missing Submit Button”)
     with st.form("form_edicion_detallada"):
         st.write(
             f"**Partido:** {row_sel.get('home_team', '')} vs {row_sel.get('away_team', '')} "
@@ -423,8 +425,17 @@ def show_gestion():
         stake_u35 = st.number_input("Stake Under 3.5", value=float(row_sel.get("stake_u35", 0) or 0), step=1.0)
         stake_1_1 = st.number_input("Stake marcador 1-1", value=float(row_sel.get("stake_1_1", 0) or 0), step=1.0)
 
-        close_minute_global = st.number_input("Minuto de cierre global", value=int(row_sel.get("close_minute_global", 0) or 0), step=1)
-        close_minute_1_1 = st.number_input("Minuto de cierre 1-1", value=int(row_sel.get("close_minute_1_1", 0) or 0), step=1)
+        # ✅ Evita int(NaN)
+        close_minute_global = st.number_input(
+            "Minuto de cierre global",
+            value=_safe_int_default(row_sel.get("close_minute_global"), 0),
+            step=1,
+        )
+        close_minute_1_1 = st.number_input(
+            "Minuto de cierre 1-1",
+            value=_safe_int_default(row_sel.get("close_minute_1_1"), 0),
+            step=1,
+        )
 
         odds_btts_no_init = st.number_input("Cuota inicial BTTS NO", value=float(row_sel.get("odds_btts_no_init", 0) or 0), step=0.01)
         odds_u35_init = st.number_input("Cuota inicial Under 3.5", value=float(row_sel.get("odds_u35_init", 0) or 0), step=0.01)
@@ -484,6 +495,7 @@ def show_gestion():
 
             if estrategia is not None and "estrategia" in filtered.columns:
                 cambios["estrategia"] = estrategia
+
             if "raroc" in filtered.columns:
                 cambios["raroc"] = raroc_calc
             if "raroc_pct" in filtered.columns:
@@ -594,42 +606,36 @@ def show_banca():
         st.error(f"Error cargando seguimiento: {e}")
         return
 
-    # ✅ IMPORTANTE: 'tipo' FUERA del form para poder cambiar min_value del importe
     st.markdown("#### Añadir movimiento")
-    tipo = st.selectbox("Tipo", options=["DEPOSITO", "RETIRADA", "AJUSTE"], key="banca_tipo_select")
-
-    # min_value dinámico
-    min_importe = -1e9 if tipo == "AJUSTE" else 0.0
-    help_importe = "En AJUSTE puedes poner negativo (baja banca) o positivo (sube banca)." if tipo == "AJUSTE" else "Introduce el importe (positivo)."
-
     with st.form("form_banca_mov"):
-        c1, c2 = st.columns([1, 2])
+        c1, c2, c3 = st.columns([1, 1, 2])
         with c1:
             fecha = st.date_input("Fecha", value=pd.Timestamp.today().date())
         with c2:
-            importe = st.number_input(
-                "Importe",
-                min_value=float(min_importe),
-                step=10.0,
-                value=0.0,
-                help=help_importe,
-            )
+            tipo = st.selectbox("Tipo", options=["DEPOSITO", "RETIRADA", "AJUSTE"])
+        with c3:
+            # ✅ Permitimos negativos en UI; validamos al guardar según tipo.
+            importe = st.number_input("Importe", value=0.0, step=10.0, format="%.2f")
 
         comentario = st.text_input("Comentario (opcional)", value="")
         submitted = st.form_submit_button("Guardar movimiento")
 
         if submitted:
-            try:
-                insert_banca_movimiento(
-                    fecha=fecha,
-                    tipo=tipo,
-                    importe=float(importe),
-                    comentario=comentario if comentario.strip() else None,
-                )
-                st.success("Movimiento guardado.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error guardando movimiento: {e}")
+            t = (tipo or "").upper().strip()
+            if t in ("DEPOSITO", "RETIRADA") and float(importe) < 0:
+                st.error("Para DEPÓSITO/RETIRADA el importe debe ser positivo. Para ajustes usa tipo AJUSTE.")
+            else:
+                try:
+                    insert_banca_movimiento(
+                        fecha=fecha,
+                        tipo=tipo,
+                        importe=float(importe),
+                        comentario=comentario if comentario.strip() else None,
+                    )
+                    st.success("Movimiento guardado.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error guardando movimiento: {e}")
 
     st.markdown("---")
 
