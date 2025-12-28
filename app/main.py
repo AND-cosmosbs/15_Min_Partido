@@ -2,6 +2,7 @@
 
 import os
 import sys
+from typing import Optional, Dict, Any, List
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +26,15 @@ from backend.seguimiento import (  # type: ignore
 from backend.banca import (  # type: ignore
     fetch_banca_movimientos,
     insert_banca_movimiento,
+)
+
+# ✅ VIX
+from backend.supabase_client import supabase  # type: ignore
+from backend.vix import (  # type: ignore
+    DEFAULT_CFG,
+    download_yahoo_daily,
+    compute_features,
+    decide_state_row,
 )
 
 # ---------- CARGA HISTÓRICO (CACHEADO) ----------
@@ -172,6 +182,190 @@ def _compute_equity_curve(
     cal.loc[ok, "drawdown_pct"] = cal.loc[ok, "drawdown_abs"] / cal.loc[ok, "peak"]
 
     return cal
+
+
+# ======================================================================
+# VIX HELPERS (adaptados a tus 3 tablas)
+# ======================================================================
+
+def _vix_regime_from_row(row: pd.Series) -> Optional[str]:
+    vix = row.get("vix")
+    p25 = row.get("vix_p25")
+    p50 = row.get("vix_p50")
+    p65 = row.get("vix_p65")
+    p85 = row.get("vix_p85")
+    if pd.isna(vix) or pd.isna(p25) or pd.isna(p50) or pd.isna(p65) or pd.isna(p85):
+        return None
+    if vix < p25:
+        return "CALMA"
+    if vix < p65:
+        return "ALERTA"
+    if vix < p85:
+        return "TENSION"
+    return "PANICO"
+
+
+def _contango_estado_from_row(row: pd.Series) -> Optional[str]:
+    ma3 = row.get("vixy_ma3")
+    ma10 = row.get("vixy_ma10")
+    if pd.isna(ma3) or pd.isna(ma10):
+        return None
+    # transición si están casi iguales (±0.25%)
+    if ma10 != 0 and abs((ma3 - ma10) / ma10) <= 0.0025:
+        return "TRANSICION"
+    if ma3 < ma10:
+        return "CONTANGO"
+    return "BACKWARDATION"
+
+
+def _map_estado_to_signal(estado: str) -> str:
+    # tu tabla vix_signal define: 'SVIX' | 'NEUTRAL' | 'UVIX' | 'CERRAR_UVIX'
+    if estado == "PREP_SVIX":
+        return "CERRAR_UVIX"
+    if estado in ("SVIX", "NEUTRAL", "UVIX"):
+        return estado
+    return "NEUTRAL"
+
+
+def _fetch_table_safe(table: str) -> pd.DataFrame:
+    try:
+        resp = supabase.table(table).select("*").execute()
+        if getattr(resp, "error", None):
+            return pd.DataFrame()
+        data = getattr(resp, "data", None) or []
+        return pd.DataFrame(data)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _upsert_vix_daily_from_features(df_feat: pd.DataFrame) -> int:
+    if df_feat is None or df_feat.empty:
+        return 0
+
+    w = df_feat.copy()
+    w["fecha"] = pd.to_datetime(w["date"], errors="coerce").dt.date
+
+    # normalizaciones
+    for c in ["vix", "vxn", "vixy", "spy", "vxn_vix_ratio", "spy_ret", "vix_p25", "vix_p50", "vix_p65", "vix_p85", "vixy_ma3", "vixy_ma10"]:
+        if c in w.columns:
+            w[c] = pd.to_numeric(w[c], errors="coerce")
+
+    w["vix_regime"] = w.apply(_vix_regime_from_row, axis=1)
+    w["contango_estado"] = w.apply(_contango_estado_from_row, axis=1)
+
+    # tu SQL usa vixy_ma_3 y vixy_ma_10
+    payload = pd.DataFrame({
+        "fecha": w["fecha"],
+        "vix": w.get("vix"),
+        "vxn": w.get("vxn"),
+        "vixy": w.get("vixy"),
+        "spy": w.get("spy"),
+        "vxn_vix_ratio": w.get("vxn_vix_ratio"),
+        "vix_p25": w.get("vix_p25"),
+        "vix_p50": w.get("vix_p50"),
+        "vix_p65": w.get("vix_p65"),
+        "vix_p85": w.get("vix_p85"),
+        "vix_regime": w.get("vix_regime"),
+        "vixy_ma_3": w.get("vixy_ma3"),
+        "vixy_ma_10": w.get("vixy_ma10"),
+        "contango_estado": w.get("contango_estado"),
+    })
+
+    payload = payload.dropna(subset=["fecha"]).copy()
+    records: List[Dict[str, Any]] = payload.to_dict(orient="records")
+
+    if not records:
+        return 0
+
+    resp = supabase.table("vix_daily").upsert(records, on_conflict="fecha").execute()
+    if getattr(resp, "error", None):
+        raise RuntimeError(f"Error upsert vix_daily: {resp.error}")
+    return len(records)
+
+
+def _upsert_vix_signal_from_states(df_states: pd.DataFrame) -> int:
+    if df_states is None or df_states.empty:
+        return 0
+
+    w = df_states.copy()
+    w["fecha"] = pd.to_datetime(w["date"], errors="coerce").dt.date
+
+    for c in ["vix", "vxn_vix_ratio", "spy_ret", "vixy_ma3", "vixy_ma10"]:
+        if c in w.columns:
+            w[c] = pd.to_numeric(w[c], errors="coerce")
+
+    w["contango_estado"] = w.apply(_contango_estado_from_row, axis=1)
+    w["estado_signal"] = w.get("estado", "NEUTRAL").astype(str).apply(_map_estado_to_signal)
+
+    payload = pd.DataFrame({
+        "fecha": w["fecha"],
+        "estado": w["estado_signal"],
+        "motivo": w.get("comentario"),
+        "vix": w.get("vix"),
+        "vxn_vix_ratio": w.get("vxn_vix_ratio"),
+        "contango_estado": w.get("contango_estado"),
+        "spy_return": w.get("spy_ret"),
+        "macro_evento": False,  # (tu tabla tiene campo, pero aún no estamos metiendo macro)
+    })
+
+    payload = payload.dropna(subset=["fecha"]).copy()
+    records: List[Dict[str, Any]] = payload.to_dict(orient="records")
+    if not records:
+        return 0
+
+    resp = supabase.table("vix_signal").upsert(records, on_conflict="fecha").execute()
+    if getattr(resp, "error", None):
+        raise RuntimeError(f"Error upsert vix_signal: {resp.error}")
+    return len(records)
+
+
+def _fetch_vix_daily() -> pd.DataFrame:
+    try:
+        resp = supabase.table("vix_daily").select("*").order("fecha", desc=False).execute()
+        if getattr(resp, "error", None):
+            return pd.DataFrame()
+        data = getattr(resp, "data", None) or []
+        df = pd.DataFrame(data)
+        if not df.empty and "fecha" in df.columns:
+            df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _fetch_vix_signal() -> pd.DataFrame:
+    try:
+        resp = supabase.table("vix_signal").select("*").order("fecha", desc=False).execute()
+        if getattr(resp, "error", None):
+            return pd.DataFrame()
+        data = getattr(resp, "data", None) or []
+        df = pd.DataFrame(data)
+        if not df.empty and "fecha" in df.columns:
+            df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _fetch_vix_trades() -> pd.DataFrame:
+    try:
+        resp = supabase.table("vix_trades").select("*").order("created_at", desc=True).execute()
+        if getattr(resp, "error", None):
+            return pd.DataFrame()
+        data = getattr(resp, "data", None) or []
+        df = pd.DataFrame(data)
+        for c in ["fecha_signal", "fecha_entrada", "fecha_salida"]:
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _insert_vix_trade(tr: Dict[str, Any]) -> None:
+    resp = supabase.table("vix_trades").insert(tr).execute()
+    if getattr(resp, "error", None):
+        raise RuntimeError(f"Error insertando vix_trades: {resp.error}")
 
 
 # ======================================================================
@@ -405,7 +599,6 @@ def show_gestion():
     selected_id = ids[seleccion]
     row_sel = filtered[filtered["id"] == selected_id].iloc[0]
 
-    # ✅ FORM SIEMPRE con submit (evita “Missing Submit Button”)
     with st.form("form_edicion_detallada"):
         st.write(
             f"**Partido:** {row_sel.get('home_team', '')} vs {row_sel.get('away_team', '')} "
@@ -425,7 +618,6 @@ def show_gestion():
         stake_u35 = st.number_input("Stake Under 3.5", value=float(row_sel.get("stake_u35", 0) or 0), step=1.0)
         stake_1_1 = st.number_input("Stake marcador 1-1", value=float(row_sel.get("stake_1_1", 0) or 0), step=1.0)
 
-        # ✅ Evita int(NaN)
         close_minute_global = st.number_input(
             "Minuto de cierre global",
             value=_safe_int_default(row_sel.get("close_minute_global"), 0),
@@ -614,28 +806,23 @@ def show_banca():
         with c2:
             tipo = st.selectbox("Tipo", options=["DEPOSITO", "RETIRADA", "AJUSTE"])
         with c3:
-            # ✅ Permitimos negativos en UI; validamos al guardar según tipo.
             importe = st.number_input("Importe", value=0.0, step=10.0, format="%.2f")
 
         comentario = st.text_input("Comentario (opcional)", value="")
         submitted = st.form_submit_button("Guardar movimiento")
 
         if submitted:
-            t = (tipo or "").upper().strip()
-            if t in ("DEPOSITO", "RETIRADA") and float(importe) < 0:
-                st.error("Para DEPÓSITO/RETIRADA el importe debe ser positivo. Para ajustes usa tipo AJUSTE.")
-            else:
-                try:
-                    insert_banca_movimiento(
-                        fecha=fecha,
-                        tipo=tipo,
-                        importe=float(importe),
-                        comentario=comentario if comentario.strip() else None,
-                    )
-                    st.success("Movimiento guardado.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error guardando movimiento: {e}")
+            try:
+                insert_banca_movimiento(
+                    fecha=fecha,
+                    tipo=tipo,
+                    importe=float(importe),
+                    comentario=comentario if comentario.strip() else None,
+                )
+                st.success("Movimiento guardado.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error guardando movimiento: {e}")
 
     st.markdown("---")
 
@@ -863,6 +1050,170 @@ def show_supervivencia_convexidad():
 
 
 # ======================================================================
+# VISTA: VIX (lectura + actualización + seguimiento trades)
+# ======================================================================
+def show_vix():
+    st.markdown("### VIX – Régimen + Señal diaria + Seguimiento de trades")
+
+    with st.expander("1) Actualizar datos (Yahoo → Supabase)", expanded=True):
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            start = st.date_input("Inicio descarga", value=pd.Timestamp("2025-01-01").date(), key="vix_start")
+        with c2:
+            end = st.date_input("Fin descarga (exclusivo)", value=(pd.Timestamp.today() + pd.Timedelta(days=1)).date(), key="vix_end")
+        with c3:
+            st.caption("Nota: rolling 252 necesita histórico suficiente.")
+
+        run = st.button("Actualizar VIX (descargar + calcular + guardar)", key="btn_run_vix")
+
+        if run:
+            try:
+                raw = download_yahoo_daily(start=str(start), end=str(end))
+                feat = compute_features(raw, cfg=DEFAULT_CFG)
+
+                # estados (sin macro por ahora; tu tabla macro no existe)
+                states = feat.copy()
+                estados = []
+                acciones = []
+                comentarios = []
+                for _, r in states.iterrows():
+                    # parche: decidimos igual pero macro_tomorrow = False
+                    rr = r.copy()
+                    rr["macro_tomorrow"] = False
+                    res = decide_state_row(rr, cfg=DEFAULT_CFG)
+                    estados.append(res["estado"])
+                    acciones.append(res["accion"])
+                    comentarios.append(res["comentario"])
+                states["estado"] = estados
+                states["accion"] = acciones
+                states["comentario"] = comentarios
+
+                n1 = _upsert_vix_daily_from_features(states)
+                n2 = _upsert_vix_signal_from_states(states)
+
+                st.success(f"OK. Guardados/actualizados: vix_daily={n1} filas, vix_signal={n2} filas.")
+            except Exception as e:
+                st.error(f"Error actualizando VIX: {e}")
+
+    st.markdown("---")
+
+    vix_daily = _fetch_vix_daily()
+    vix_signal = _fetch_vix_signal()
+
+    if vix_signal.empty and vix_daily.empty:
+        st.info("Aún no hay datos. Ejecuta ‘Actualizar VIX’ arriba.")
+        return
+
+    # Última señal
+    if not vix_signal.empty:
+        last = vix_signal.sort_values("fecha").iloc[-1]
+        estado = last.get("estado", "—")
+        motivo = last.get("motivo", "")
+        st.markdown("#### 2) Señal más reciente")
+        c1, c2, c3 = st.columns([1, 2, 2])
+        c1.metric("Estado", str(estado))
+        c2.write(f"**Fecha:** {pd.to_datetime(last.get('fecha')).date() if pd.notna(last.get('fecha')) else '—'}")
+        c3.write(f"**Motivo:** {motivo}")
+
+    st.markdown("#### 3) Gráficos")
+    if not vix_daily.empty:
+        d = vix_daily.copy()
+        for c in ["vix", "vix_p25", "vix_p50", "vix_p65", "vix_p85", "vxn_vix_ratio", "vixy_ma_3", "vixy_ma_10", "spy"]:
+            _safe_numeric(d, c)
+
+        # VIX + percentiles
+        cols = [c for c in ["vix", "vix_p25", "vix_p50", "vix_p65", "vix_p85"] if c in d.columns]
+        if cols and "fecha" in d.columns:
+            st.markdown("**VIX + percentiles (252)**")
+            st.line_chart(d.set_index("fecha")[cols], use_container_width=True)
+
+        # Ratio VXN/VIX
+        if "vxn_vix_ratio" in d.columns and "fecha" in d.columns:
+            st.markdown("**Ratio VXN/VIX**")
+            st.line_chart(d.set_index("fecha")[["vxn_vix_ratio"]], use_container_width=True)
+
+        # Contango proxy (MA3 vs MA10)
+        ma_cols = [c for c in ["vixy_ma_3", "vixy_ma_10"] if c in d.columns]
+        if ma_cols and "fecha" in d.columns:
+            st.markdown("**VIXY MA3 vs MA10 (proxy contango/backwardation)**")
+            st.line_chart(d.set_index("fecha")[ma_cols], use_container_width=True)
+
+    # Timeline de estados (tabla)
+    if not vix_signal.empty:
+        st.markdown("#### 4) Histórico de señales (tabla)")
+        show = vix_signal.copy()
+        cols_show = [c for c in ["fecha", "estado", "vix", "vxn_vix_ratio", "contango_estado", "spy_return", "macro_evento", "motivo"] if c in show.columns]
+        show = show[cols_show].sort_values("fecha", ascending=False)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("### 5) Seguimiento de trades (vix_trades)")
+
+    trades = _fetch_vix_trades()
+
+    with st.expander("Añadir trade (manual)", expanded=False):
+        # por defecto, usar la última señal si existe
+        last_fecha = None
+        last_estado = "NEUTRAL"
+        if not vix_signal.empty:
+            last_row = vix_signal.sort_values("fecha").iloc[-1]
+            last_fecha = pd.to_datetime(last_row.get("fecha"), errors="coerce")
+            last_estado = str(last_row.get("estado", "NEUTRAL"))
+
+        with st.form("form_vix_trade"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                fecha_signal = st.date_input("Fecha señal", value=(last_fecha.date() if last_fecha is not None and pd.notna(last_fecha) else pd.Timestamp.today().date()))
+            with c2:
+                estado_signal = st.selectbox("Estado señal", options=["SVIX", "NEUTRAL", "UVIX", "CERRAR_UVIX"], index=["SVIX","NEUTRAL","UVIX","CERRAR_UVIX"].index(last_estado) if last_estado in ["SVIX","NEUTRAL","UVIX","CERRAR_UVIX"] else 1)
+            with c3:
+                instrumento = st.selectbox("Instrumento", options=["SVIX", "UVIX"])
+
+            c4, c5, c6 = st.columns(3)
+            with c4:
+                fecha_entrada = st.date_input("Fecha entrada", value=pd.Timestamp.today().date(), key="vix_trade_in")
+            with c5:
+                precio_entrada = st.number_input("Precio entrada", value=0.0, step=0.01, format="%.4f")
+            with c6:
+                size = st.number_input("Size (qty)", value=0.0, step=1.0)
+
+            c7, c8, c9 = st.columns(3)
+            with c7:
+                fecha_salida = st.date_input("Fecha salida (si cerrado)", value=pd.Timestamp.today().date(), key="vix_trade_out")
+            with c8:
+                precio_salida = st.number_input("Precio salida (si cerrado)", value=0.0, step=0.01, format="%.4f")
+            with c9:
+                pnl = st.number_input("PNL (€) (opcional)", value=0.0, step=1.0)
+
+            submitted = st.form_submit_button("Guardar trade")
+
+            if submitted:
+                try:
+                    tr = {
+                        "fecha_signal": str(fecha_signal),
+                        "estado_signal": estado_signal,
+                        "instrumento": instrumento,
+                        "fecha_entrada": str(fecha_entrada) if fecha_entrada else None,
+                        "precio_entrada": float(precio_entrada) if precio_entrada else None,
+                        "fecha_salida": str(fecha_salida) if fecha_salida else None,
+                        "precio_salida": float(precio_salida) if precio_salida else None,
+                        "size": float(size) if size else None,
+                        "pnl": float(pnl) if pnl else None,
+                        "estrategia": "VIX_REGIME",
+                    }
+                    _insert_vix_trade(tr)
+                    st.success("Trade guardado.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error guardando trade: {e}")
+
+    if trades.empty:
+        st.info("No hay trades todavía.")
+    else:
+        st.dataframe(trades, use_container_width=True, hide_index=True)
+
+
+# ======================================================================
 # INTERFAZ PRINCIPAL
 # ======================================================================
 def main():
@@ -877,6 +1228,7 @@ def main():
             "Estadísticas ROI",
             "Supervivencia & Convexidad",
             "Banca",
+            "VIX",
         ],
     )
 
@@ -892,9 +1244,12 @@ def main():
     elif modo == "Supervivencia & Convexidad":
         st.title("Supervivencia & Convexidad")
         show_supervivencia_convexidad()
-    else:
+    elif modo == "Banca":
         st.title("Banca")
         show_banca()
+    else:
+        st.title("VIX")
+        show_vix()
 
 
 if __name__ == "__main__":
