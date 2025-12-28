@@ -1,18 +1,17 @@
 # backend/vix.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 import pandas as pd
 
 from .supabase_client import supabase
 
 
-# -----------------------------
-# Config
-# -----------------------------
+# =========================================================
+# CONFIG
+# =========================================================
 
 @dataclass
 class VixConfig:
@@ -20,30 +19,29 @@ class VixConfig:
     ratio_alert: float = 1.30
     ratio_ok: float = 1.25
 
-    # percentiles usados como umbrales
-    vix_panic: float = 0.85   # P85
-    vix_tension: float = 0.65 # P65
-    vix_calm: float = 0.25    # P25
+    # percentiles
+    p25: float = 0.25
+    p50: float = 0.50
+    p65: float = 0.65
+    p85: float = 0.85
 
-    # Guardarraíl “VIX demasiado bajo”
+    # guardrail anti “VIX demasiado bajo”
     use_guardrail: bool = True
-    guardrail_p10: float = 0.10
-    guardrail_vix_floor: float = 12.5  # si VIX < 12.5 => no abrir SVIX
+    guardrail_vix_floor: float = 12.5
 
 
 DEFAULT_CFG = VixConfig()
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# =========================================================
+# HELPERS
+# =========================================================
 
 def _safe_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
 
-def _iso_date(x) -> Optional[str]:
-    """Devuelve 'YYYY-MM-DD' o None."""
+def _as_date_str(x) -> Optional[str]:
     try:
         d = pd.to_datetime(x, errors="coerce")
         if pd.isna(d):
@@ -55,8 +53,7 @@ def _iso_date(x) -> Optional[str]:
 
 def _try_fetch_macro_events() -> pd.DataFrame:
     """
-    Si existe tabla macro_events(fecha, label, impacto, activo) la usa.
-    Si NO existe, devuelve DF vacío sin romper.
+    Si existe la tabla macro_events la usamos. Si no existe, devolvemos vacío (NO rompe).
     """
     try:
         resp = supabase.table("macro_events").select("*").execute()
@@ -82,15 +79,13 @@ def _macro_tomorrow_flag(fecha: pd.Timestamp, macro_df: pd.DataFrame) -> bool:
         return False
     tomorrow = (fecha + pd.Timedelta(days=1)).date()
     w = macro_df.copy()
-    if "activo" not in w.columns:
-        w["activo"] = True
     w = w[(w["activo"] == True) & (w["fecha"] == tomorrow)]
     return len(w) > 0
 
 
-# -----------------------------
-# Yahoo download
-# -----------------------------
+# =========================================================
+# YAHOO DOWNLOAD
+# =========================================================
 
 def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
     """
@@ -111,16 +106,42 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
 
     for tkr, col in tickers.items():
         data = yf.download(
-            tkr, start=start, end=end, interval="1d",
-            auto_adjust=True, progress=False
+            tkr,
+            start=start,
+            end=end,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
         )
         if data is None or data.empty:
-            raise RuntimeError(f"No hay datos para {tkr} en Yahoo Finance para {start}..{end}")
+            raise RuntimeError(f"No hay datos Yahoo para {tkr} en {start}..{end}")
 
-        s = data["Close"].copy()
+        # yfinance a veces devuelve columnas con espacios raros / multiindex en algunos casos:
+        if isinstance(data.columns, pd.MultiIndex):
+            # intentamos quedarnos con Close
+            if ("Close" in data.columns.get_level_values(0)):
+                close = data["Close"]
+                if isinstance(close, pd.DataFrame) and close.shape[1] >= 1:
+                    s = close.iloc[:, 0].copy()
+                else:
+                    s = close.copy()
+            else:
+                # fallback
+                s = data.iloc[:, 0].copy()
+        else:
+            if "Close" in data.columns:
+                s = data["Close"].copy()
+            else:
+                s = data.iloc[:, 0].copy()
+
         s.name = col
         df = s.reset_index()
-        df.rename(columns={"Date": "date"}, inplace=True)
+        # Date o Datetime según yfinance
+        if "Date" in df.columns:
+            df.rename(columns={"Date": "date"}, inplace=True)
+        elif "Datetime" in df.columns:
+            df.rename(columns={"Datetime": "date"}, inplace=True)
+
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
 
         out = df if out is None else out.merge(df, on="date", how="outer")
@@ -129,47 +150,64 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
     return out
 
 
-# -----------------------------
-# Features + estado (alineado con tus tablas)
-# -----------------------------
+# =========================================================
+# FEATURES + REGLAS (adaptadas a tus tablas SQL)
+# =========================================================
 
 def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
     """
     df: columnas date, vix, vxn, vixy, spy
     """
     w = df.copy()
+
+    # Asegura columnas (y así si algo falla, lo verás claro)
+    for c in ["date", "vix", "vxn", "vixy", "spy"]:
+        if c not in w.columns:
+            raise KeyError(c)
+
     w["vix"] = _safe_num(w["vix"])
     w["vxn"] = _safe_num(w["vxn"])
     w["vixy"] = _safe_num(w["vixy"])
     w["spy"] = _safe_num(w["spy"])
 
-    # SPY retorno diario
-    w["spy_ret"] = w["spy"].pct_change()
-
-    # Ratio VXN/VIX + dirección
+    w["spy_return"] = w["spy"].pct_change()
     w["vxn_vix_ratio"] = w["vxn"] / w["vix"]
     w["ratio_up"] = w["vxn_vix_ratio"].diff() > 0
 
-    # VIX percentiles rolling (252)
     lb = int(cfg.lookback_pct)
-    w["vix_p10"] = w["vix"].rolling(lb).quantile(0.10)
-    w["vix_p25"] = w["vix"].rolling(lb).quantile(0.25)
-    w["vix_p50"] = w["vix"].rolling(lb).quantile(0.50)
-    w["vix_p65"] = w["vix"].rolling(lb).quantile(0.65)
-    w["vix_p85"] = w["vix"].rolling(lb).quantile(0.85)
+    w["vix_p25"] = w["vix"].rolling(lb).quantile(cfg.p25)
+    w["vix_p50"] = w["vix"].rolling(lb).quantile(cfg.p50)
+    w["vix_p65"] = w["vix"].rolling(lb).quantile(cfg.p65)
+    w["vix_p85"] = w["vix"].rolling(lb).quantile(cfg.p85)
 
-    # VIXY MA3 vs MA10 (ojo: en tu SQL son vixy_ma_3 y vixy_ma_10)
     w["vixy_ma_3"] = w["vixy"].rolling(3).mean()
     w["vixy_ma_10"] = w["vixy"].rolling(10).mean()
 
     return w
 
 
-def _contango_estado(row: pd.Series) -> Optional[str]:
+def _vix_regime(row: pd.Series) -> str:
+    vix = row.get("vix")
+    p25 = row.get("vix_p25")
+    p50 = row.get("vix_p50")
+    p65 = row.get("vix_p65")
+    p85 = row.get("vix_p85")
+    if pd.isna(vix) or pd.isna(p25) or pd.isna(p50) or pd.isna(p65) or pd.isna(p85):
+        return "NA"
+    if vix < p25:
+        return "CALMA"
+    if vix < p65:
+        return "ALERTA"  # zona media amplia
+    if vix < p85:
+        return "TENSION"
+    return "PANICO"
+
+
+def _contango_estado(row: pd.Series) -> str:
     ma3 = row.get("vixy_ma_3")
     ma10 = row.get("vixy_ma_10")
     if pd.isna(ma3) or pd.isna(ma10):
-        return None
+        return "NA"
     if ma3 < ma10:
         return "CONTANGO"
     if ma3 > ma10:
@@ -177,162 +215,170 @@ def _contango_estado(row: pd.Series) -> Optional[str]:
     return "TRANSICION"
 
 
-def _vix_regime(row: pd.Series) -> Optional[str]:
-    vix = row.get("vix")
-    p25 = row.get("vix_p25")
-    p65 = row.get("vix_p65")
-    p85 = row.get("vix_p85")
-    if pd.isna(vix) or pd.isna(p25) or pd.isna(p65) or pd.isna(p85):
-        return None
-    if vix < p25:
-        return "CALMA"
-    if vix < p65:
-        return "ALERTA"
-    if vix < p85:
-        return "TENSION"
-    return "PANICO"
-
-
-def decide_estado(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Tuple[str, str, bool]:
+def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, Any]:
     """
-    Devuelve (estado_signal, motivo, macro_evento)
-    estado_signal: 'SVIX' | 'NEUTRAL' | 'UVIX' | 'CERRAR_UVIX'
+    Devuelve estado + motivo, usando:
+    - vix percentiles
+    - ratio vxn/vix
+    - contango proxy (VIXY MA3 vs MA10)
+    - spy_return
+    - macro_evento (si existe macro_events)
     """
     vix = row.get("vix")
-    p10 = row.get("vix_p10")
     p25 = row.get("vix_p25")
     p65 = row.get("vix_p65")
     p85 = row.get("vix_p85")
 
     ratio = row.get("vxn_vix_ratio")
     ratio_up = bool(row.get("ratio_up")) if pd.notna(row.get("ratio_up")) else False
-    spy_ret = row.get("spy_ret")
-    contango = _contango_estado(row)
-    macro_tomorrow = bool(row.get("macro_tomorrow")) if pd.notna(row.get("macro_tomorrow")) else False
 
-    # Si aún no hay rolling
+    ma3 = row.get("vixy_ma_3")
+    ma10 = row.get("vixy_ma_10")
+    contango_ok = (pd.notna(ma3) and pd.notna(ma10) and (ma3 < ma10))
+    contango_bad = (pd.notna(ma3) and pd.notna(ma10) and (ma3 > ma10))
+
+    spy_ret = row.get("spy_return")
+    macro_evento = bool(row.get("macro_evento")) if pd.notna(row.get("macro_evento")) else False
+
+    # no hay percentiles aún
     if pd.isna(vix) or pd.isna(p25) or pd.isna(p65) or pd.isna(p85):
-        return ("NEUTRAL", "Insuficiente histórico para percentiles (rolling 252).", macro_tomorrow)
+        return {"estado": "NEUTRAL", "motivo": "Insuficiente histórico rolling 252."}
 
-    # Guardarraíl anti “VIX demasiado bajo”
-    if cfg.use_guardrail:
-        too_low_by_p10 = (pd.notna(p10) and vix < p10)
-        too_low_by_floor = (pd.notna(vix) and vix < cfg.guardrail_vix_floor)
-        if too_low_by_p10 or too_low_by_floor:
-            return ("NEUTRAL", "Guardarraíl: VIX extremadamente bajo (snapback).", macro_tomorrow)
+    # guardrail: vix demasiado bajo
+    if cfg.use_guardrail and pd.notna(vix) and vix < cfg.guardrail_vix_floor:
+        return {"estado": "NEUTRAL", "motivo": f"Guardrail: VIX < {cfg.guardrail_vix_floor} (snapback risk)."}
 
-    # SVIX: todas
+    # SVIX (todas)
     cond_svix = (
         (vix < p25)
         and (pd.notna(ratio) and ratio < cfg.ratio_ok)
-        and (contango == "CONTANGO")
-        and (macro_tomorrow is False)
+        and contango_ok
+        and (macro_evento is False)
     )
     if cond_svix:
-        return ("SVIX", "VIX < P25 + ratio VXN/VIX bajo + contango + sin macro mañana.", macro_tomorrow)
+        return {"estado": "SVIX", "motivo": "VIX < P25 + ratio OK + contango + sin macro."}
 
-    # UVIX: mínimo 2
-    uvix_cond1 = vix > p65
-    uvix_cond2 = (pd.notna(ratio) and ratio > cfg.ratio_alert and ratio_up)
-    uvix_cond3 = (contango == "BACKWARDATION")
-    uvix_cond4 = (pd.notna(spy_ret) and spy_ret < -0.008)
+    # UVIX (2 de 4)
+    c1 = vix > p65
+    c2 = (pd.notna(ratio) and ratio > cfg.ratio_alert and ratio_up)
+    c3 = contango_bad
+    c4 = (pd.notna(spy_ret) and spy_ret < -0.008)
 
-    score = sum([bool(uvix_cond1), bool(uvix_cond2), bool(uvix_cond3), bool(uvix_cond4)])
+    score = sum([bool(c1), bool(c2), bool(c3), bool(c4)])
     if score >= 2:
-        return ("UVIX", f"Stress (score={score}) -> UVIX.", macro_tomorrow)
+        return {"estado": "UVIX", "motivo": f"Stress score={score} (VIX/radio/contango/SPY)."}
 
-    # CERRAR_UVIX / preparar SVIX (tu “purple”)
-    cond_close_uvix = (vix > p85) and (ratio_up is False) and (contango == "CONTANGO")
-    if cond_close_uvix:
-        return ("CERRAR_UVIX", "Pánico agotándose + contango vuelve. Cerrar UVIX / preparar SVIX.", macro_tomorrow)
+    # PURPLE (tu regla “pánico agotándose”)
+    cond_purple = (vix > p85) and (ratio_up is False) and contango_ok
+    if cond_purple:
+        return {"estado": "CERRAR_UVIX", "motivo": "Pánico + ratio deja de subir + contango vuelve."}
 
-    return ("NEUTRAL", "Régimen mixto / transición.", macro_tomorrow)
+    return {"estado": "NEUTRAL", "motivo": "Régimen mixto / transición."}
 
 
-def compute_and_store_states(df_raw: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
-    """
-    Calcula features, estado y guarda en:
-      - vix_daily (tu tabla)
-      - vix_signal (tu tabla)
-    """
-    feat = compute_features(df_raw, cfg=cfg)
+def compute_states(df_feat: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
+    w = df_feat.copy()
 
-    macro_df = _try_fetch_macro_events()
-    feat["macro_tomorrow"] = feat["date"].apply(
-        lambda d: _macro_tomorrow_flag(pd.to_datetime(d), macro_df) if pd.notna(d) else False
+    macro = _try_fetch_macro_events()
+    w["macro_evento"] = w["date"].apply(
+        lambda d: _macro_tomorrow_flag(pd.to_datetime(d), macro) if pd.notna(d) else False
     )
 
-    # construir filas de daily + signal
-    daily_records: List[Dict[str, Any]] = []
-    signal_records: List[Dict[str, Any]] = []
+    estados = []
+    motivos = []
+    for _, r in w.iterrows():
+        res = decide_state_row(r, cfg=cfg)
+        estados.append(res["estado"])
+        motivos.append(res["motivo"])
 
-    for _, r in feat.iterrows():
-        fecha_str = _iso_date(r.get("date"))
-        if not fecha_str:
+    w["estado"] = estados
+    w["motivo"] = motivos
+    w["vix_regime"] = w.apply(_vix_regime, axis=1)
+    w["contango_estado"] = w.apply(_contango_estado, axis=1)
+
+    return w
+
+
+# =========================================================
+# SUPABASE I/O (AJUSTADO A TUS TABLAS SQL)
+# =========================================================
+
+def upsert_vix_daily(df: pd.DataFrame) -> int:
+    """
+    Escribe en tu tabla vix_daily (la del SQL que pegaste):
+      fecha PK
+      vix, vxn_vix_ratio, vix_p25/p50/p65/p85, vix_regime,
+      vixy_ma_3, vixy_ma_10, contango_estado
+    """
+    if df.empty:
+        return 0
+
+    w = df.copy()
+    w["fecha"] = w["date"].apply(_as_date_str)
+
+    records: List[Dict[str, Any]] = []
+    for _, r in w.iterrows():
+        if not r.get("fecha"):
             continue
+        rec = {
+            "fecha": r.get("fecha"),
+            "vix": None if pd.isna(r.get("vix")) else float(r.get("vix")),
+            "vxn_vix_ratio": None if pd.isna(r.get("vxn_vix_ratio")) else float(r.get("vxn_vix_ratio")),
+            "vix_p25": None if pd.isna(r.get("vix_p25")) else float(r.get("vix_p25")),
+            "vix_p50": None if pd.isna(r.get("vix_p50")) else float(r.get("vix_p50")),
+            "vix_p65": None if pd.isna(r.get("vix_p65")) else float(r.get("vix_p65")),
+            "vix_p85": None if pd.isna(r.get("vix_p85")) else float(r.get("vix_p85")),
+            "vix_regime": r.get("vix_regime"),
+            "vixy_ma_3": None if pd.isna(r.get("vixy_ma_3")) else float(r.get("vixy_ma_3")),
+            "vixy_ma_10": None if pd.isna(r.get("vixy_ma_10")) else float(r.get("vixy_ma_10")),
+            "contango_estado": r.get("contango_estado"),
+        }
+        records.append(rec)
 
-        # daily
-        vix_reg = _vix_regime(r)
-        cont = _contango_estado(r)
+    if not records:
+        return 0
 
-        daily_records.append({
-            "fecha": fecha_str,                      # STRING (JSON OK)
-            "vix": float(r["vix"]) if pd.notna(r.get("vix")) else None,
-            "vxn": float(r["vxn"]) if pd.notna(r.get("vxn")) else None,
-            "vixy": float(r["vixy"]) if pd.notna(r.get("vixy")) else None,
-            "spy": float(r["spy"]) if pd.notna(r.get("spy")) else None,
+    resp = supabase.table("vix_daily").upsert(records, on_conflict="fecha").execute()
+    if getattr(resp, "error", None):
+        raise RuntimeError(f"Error upsert vix_daily: {resp.error}")
 
-            "vxn_vix_ratio": float(r["vxn_vix_ratio"]) if pd.notna(r.get("vxn_vix_ratio")) else None,
-
-            "vix_p25": float(r["vix_p25"]) if pd.notna(r.get("vix_p25")) else None,
-            "vix_p50": float(r["vix_p50"]) if pd.notna(r.get("vix_p50")) else None,
-            "vix_p65": float(r["vix_p65"]) if pd.notna(r.get("vix_p65")) else None,
-            "vix_p85": float(r["vix_p85"]) if pd.notna(r.get("vix_p85")) else None,
-
-            "vix_regime": vix_reg,
-            "vixy_ma_3": float(r["vixy_ma_3"]) if pd.notna(r.get("vixy_ma_3")) else None,
-            "vixy_ma_10": float(r["vixy_ma_10"]) if pd.notna(r.get("vixy_ma_10")) else None,
-            "contango_estado": cont,
-        })
-
-        # signal
-        estado, motivo, macro_flag = decide_estado(r, cfg=cfg)
-        signal_records.append({
-            "fecha": fecha_str,  # PK DATE en tu SQL, mandamos string
-            "estado": estado,
-            "motivo": motivo,
-
-            "vix": float(r["vix"]) if pd.notna(r.get("vix")) else None,
-            "vxn_vix_ratio": float(r["vxn_vix_ratio"]) if pd.notna(r.get("vxn_vix_ratio")) else None,
-            "contango_estado": cont,
-            "spy_return": float(r["spy_ret"]) if pd.notna(r.get("spy_ret")) else None,
-
-            "macro_evento": bool(macro_flag),
-        })
-
-    # upsert en vix_daily por fecha (PK)
-    if daily_records:
-        resp = supabase.table("vix_daily").upsert(daily_records, on_conflict="fecha").execute()
-        if getattr(resp, "error", None):
-            raise RuntimeError(f"Error upsert vix_daily: {resp.error}")
-
-    # upsert en vix_signal por fecha (PK)
-    if signal_records:
-        resp = supabase.table("vix_signal").upsert(signal_records, on_conflict="fecha").execute()
-        if getattr(resp, "error", None):
-            raise RuntimeError(f"Error upsert vix_signal: {resp.error}")
-
-    return feat
+    return len(records)
 
 
-# -----------------------------
-# Public API (lo que usará main.py)
-# -----------------------------
+def upsert_vix_signal(df: pd.DataFrame) -> int:
+    """
+    Escribe 1 fila por día en tu tabla vix_signal (fecha PK).
+    """
+    if df.empty:
+        return 0
 
-def run_vix_pipeline(start: str, end: str, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
-    raw = download_yahoo_daily(start=start, end=end)
-    out = compute_and_store_states(raw, cfg=cfg)
-    return out
+    w = df.copy()
+    w["fecha"] = w["date"].apply(_as_date_str)
+
+    records: List[Dict[str, Any]] = []
+    for _, r in w.iterrows():
+        if not r.get("fecha"):
+            continue
+        rec = {
+            "fecha": r.get("fecha"),
+            "estado": r.get("estado") or "NEUTRAL",
+            "motivo": r.get("motivo"),
+            "vix": None if pd.isna(r.get("vix")) else float(r.get("vix")),
+            "vxn_vix_ratio": None if pd.isna(r.get("vxn_vix_ratio")) else float(r.get("vxn_vix_ratio")),
+            "contango_estado": r.get("contango_estado"),
+            "spy_return": None if pd.isna(r.get("spy_return")) else float(r.get("spy_return")),
+            "macro_evento": bool(r.get("macro_evento")) if pd.notna(r.get("macro_evento")) else False,
+        }
+        records.append(rec)
+
+    if not records:
+        return 0
+
+    resp = supabase.table("vix_signal").upsert(records, on_conflict="fecha").execute()
+    if getattr(resp, "error", None):
+        raise RuntimeError(f"Error upsert vix_signal: {resp.error}")
+
+    return len(records)
 
 
 def fetch_vix_daily() -> pd.DataFrame:
@@ -355,3 +401,16 @@ def fetch_vix_signal() -> pd.DataFrame:
     if not df.empty and "fecha" in df.columns:
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
     return df
+
+
+# =========================================================
+# ONE-SHOT PIPELINE
+# =========================================================
+
+def run_vix_pipeline(start: str, end: str, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
+    raw = download_yahoo_daily(start=start, end=end)
+    feat = compute_features(raw, cfg=cfg)
+    out = compute_states(feat, cfg=cfg)
+    upsert_vix_daily(out)
+    upsert_vix_signal(out)
+    return out
