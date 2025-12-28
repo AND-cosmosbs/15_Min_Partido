@@ -26,7 +26,7 @@ from backend.banca import (  # type: ignore
     insert_banca_movimiento,
 )
 
-# ✅ VIX: SOLO daily + pipeline (NO vix_signal)
+# ✅ VIX (SOLO vix_daily)
 from backend.vix import (  # type: ignore
     run_vix_pipeline,
     fetch_vix_daily,
@@ -680,7 +680,7 @@ def show_banca():
 
 
 # ======================================================================
-# VISTA: VIX (SOLO vix_daily)
+# VISTA: VIX (robusta: solo vix_daily)
 # ======================================================================
 def show_vix():
     st.markdown("### VIX – régimen diario (SVIX / NEUTRAL / UVIX)")
@@ -707,60 +707,52 @@ def show_vix():
         return
 
     if daily.empty:
-        st.info("No hay datos todavía en vix_daily. Pulsa ‘Actualizar VIX’.")
+        st.info("No hay datos en vix_daily todavía.")
         return
 
     daily = daily.copy()
     if "fecha" in daily.columns:
         daily["fecha"] = pd.to_datetime(daily["fecha"], errors="coerce")
         daily = daily.dropna(subset=["fecha"]).sort_values("fecha")
+    else:
+        st.error("vix_daily no tiene columna 'fecha'.")
+        return
 
-    # Última señal desde vix_daily
     last = daily.iloc[-1]
 
     st.markdown("#### Último estado")
     st.metric("Fecha", str(last.get("fecha").date()) if pd.notna(last.get("fecha")) else "—")
     st.metric("Estado", str(last.get("estado", "—")))
-    st.metric("Acción", str(last.get("accion", "—")))
+    st.write(f"**Acción:** {last.get('accion', '')}")
     st.write(f"**Comentario:** {last.get('comentario', '')}")
 
     st.markdown("---")
 
-    # Gráficos (solo si existen columnas)
-    for col in ["vix", "vxn_vix_ratio", "vixy_ma3", "vixy_ma10", "vixy_ma_3", "vixy_ma_10"]:
+    # Charts (solo si existen columnas)
+    for col in ["vix", "vxn_vix_ratio", "vixy_ma3", "vixy_ma10"]:
         _safe_numeric(daily, col)
 
-    st.markdown("#### VIX (spot)")
     if "vix" in daily.columns:
+        st.markdown("#### VIX (spot)")
         st.line_chart(daily.set_index("fecha")[["vix"]], use_container_width=True)
-    else:
-        st.info("No existe columna 'vix' en vix_daily (revisa schema).")
 
-    st.markdown("#### Ratio VXN/VIX")
     if "vxn_vix_ratio" in daily.columns:
+        st.markdown("#### Ratio VXN/VIX")
         st.line_chart(daily.set_index("fecha")[["vxn_vix_ratio"]], use_container_width=True)
 
-    st.markdown("#### Contango proxy (VIXY MA3 vs MA10)")
-    # soporta ambos nombres por si tu tabla usa _ o no
-    cont_cols = []
-    if "vixy_ma3" in daily.columns and "vixy_ma10" in daily.columns:
-        cont_cols = ["vixy_ma3", "vixy_ma10"]
-    elif "vixy_ma_3" in daily.columns and "vixy_ma_10" in daily.columns:
-        cont_cols = ["vixy_ma_3", "vixy_ma_10"]
-
-    if cont_cols:
-        st.line_chart(daily.set_index("fecha")[cont_cols], use_container_width=True)
-    else:
-        st.info("No encuentro columnas de medias VIXY (ma3/ma10) en vix_daily.")
+    cols = [c for c in ["vixy_ma3", "vixy_ma10"] if c in daily.columns]
+    if cols:
+        st.markdown("#### Contango proxy (VIXY MA3 vs MA10)")
+        st.line_chart(daily.set_index("fecha")[cols], use_container_width=True)
 
     st.markdown("#### Tabla (vix_daily)")
     show_cols = [c for c in [
-        "fecha", "vix", "vxn", "vixy", "spy",
-        "spy_ret", "vxn_vix_ratio",
-        "vix_p10", "vix_p25", "vix_p50", "vix_p65", "vix_p85",
-        "vixy_ma3", "vixy_ma10", "vixy_ma_3", "vixy_ma_10",
-        "contango_ok", "macro_tomorrow",
-        "estado", "accion", "comentario",
+        "fecha", "estado", "accion", "comentario",
+        "vix", "vxn", "vixy", "spy",
+        "vxn_vix_ratio", "contango_ok", "macro_tomorrow",
+        "vix_p25", "vix_p65", "vix_p85",
+        "vixy_ma3", "vixy_ma10",
+        "spy_ret",
     ] if c in daily.columns]
     st.dataframe(daily[show_cols].sort_values("fecha", ascending=False), use_container_width=True)
 
