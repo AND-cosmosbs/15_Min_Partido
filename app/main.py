@@ -25,6 +25,8 @@ from backend.banca import (  # type: ignore
     fetch_banca_movimientos,
     insert_banca_movimiento,
 )
+
+# ✅ VIX
 from backend.vix import (  # type: ignore
     run_vix_pipeline,
     fetch_vix_daily,
@@ -95,7 +97,7 @@ def _banca_sign(tipo: str, importe: float) -> float:
         return abs(importe)
     if t == "RETIRADA":
         return -abs(importe)
-    return float(importe)
+    return float(importe)  # AJUSTE
 
 
 def _compute_equity_curve(
@@ -416,16 +418,8 @@ def show_gestion():
         stake_u35 = st.number_input("Stake Under 3.5", value=float(row_sel.get("stake_u35", 0) or 0), step=1.0)
         stake_1_1 = st.number_input("Stake marcador 1-1", value=float(row_sel.get("stake_1_1", 0) or 0), step=1.0)
 
-        close_minute_global = st.number_input(
-            "Minuto de cierre global",
-            value=_safe_int_default(row_sel.get("close_minute_global"), 0),
-            step=1,
-        )
-        close_minute_1_1 = st.number_input(
-            "Minuto de cierre 1-1",
-            value=_safe_int_default(row_sel.get("close_minute_1_1"), 0),
-            step=1,
-        )
+        close_minute_global = st.number_input("Minuto de cierre global", value=_safe_int_default(row_sel.get("close_minute_global"), 0), step=1)
+        close_minute_1_1 = st.number_input("Minuto de cierre 1-1", value=_safe_int_default(row_sel.get("close_minute_1_1"), 0), step=1)
 
         odds_btts_no_init = st.number_input("Cuota inicial BTTS NO", value=float(row_sel.get("odds_btts_no_init", 0) or 0), step=0.01)
         odds_u35_init = st.number_input("Cuota inicial Under 3.5", value=float(row_sel.get("odds_u35_init", 0) or 0), step=0.01)
@@ -448,10 +442,10 @@ def show_gestion():
         total_stake = stake_btts_no + stake_u35 + stake_1_1
         if total_stake > 0:
             roi_calc = profit_euros / total_stake
-            st.write(f"ROI calculado: **{roi_calc*100:.2f}%** (profit / suma de stakes)")
+            st.write(f"ROI calculado: **{roi_calc*100:.2f}%**")
         else:
             roi_calc = None
-            st.write("ROI calculado: — (faltan stakes o profit)")
+            st.write("ROI calculado: —")
 
         raroc_calc = None
         raroc_pct_calc = None
@@ -460,7 +454,7 @@ def show_gestion():
             raroc_pct_calc = raroc_calc * 100.0
             st.write(f"RAROC: **{raroc_pct_calc:.4f}% por minuto**")
         else:
-            st.write("RAROC: — (necesita ROI y close_minute_global > 0).")
+            st.write("RAROC: —")
 
         apuesta_real_actual = row_sel.get("apuesta_real") or "NO"
         apuesta_real = st.selectbox("¿Apuesta real?", options=["SI", "NO"], index=0 if apuesta_real_actual == "SI" else 1)
@@ -485,7 +479,6 @@ def show_gestion():
 
             if estrategia is not None and "estrategia" in filtered.columns:
                 cambios["estrategia"] = estrategia
-
             if "raroc" in filtered.columns:
                 cambios["raroc"] = raroc_calc
             if "raroc_pct" in filtered.columns:
@@ -536,16 +529,12 @@ def show_stats():
     total_stake_sum = df["total_stake"].fillna(0).sum()
     roi_global = (total_profit / total_stake_sum) if total_stake_sum > 0 else None
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total profit (€)", f"{total_profit:,.2f}")
-    with col2:
-        st.metric("Total stake (€)", f"{total_stake_sum:,.2f}")
-    with col3:
-        st.metric("ROI global", f"{roi_global*100:.2f}%" if roi_global is not None else "—")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total profit (€)", f"{total_profit:,.2f}")
+    c2.metric("Total stake (€)", f"{total_stake_sum:,.2f}")
+    c3.metric("ROI global", f"{roi_global*100:.2f}%" if roi_global is not None else "—")
 
-    st.markdown("### Gráficos de ROI (en %)")
-
+    st.markdown("### ROI acumulado (%)")
     if "fecha" in df.columns and df["fecha"].notna().any():
         df_time = df[df["fecha"].notna()].sort_values("fecha").copy()
         df_time["profit_acum"] = df_time["profit_euros"].fillna(0).cumsum()
@@ -555,14 +544,13 @@ def show_stats():
         ok = df_time["stake_acum"] > 0
         df_time.loc[ok, "roi_acum_pct"] = (df_time.loc[ok, "profit_acum"] / df_time.loc[ok, "stake_acum"]) * 100.0
 
-        st.markdown("#### ROI acumulado en el tiempo (%)")
         st.line_chart(df_time.set_index("fecha")[["roi_acum_pct"]], use_container_width=True)
     else:
         st.info("No hay fechas válidas para dibujar ROI acumulado.")
 
 
 # ======================================================================
-# VISTA: BANCA (equity + ROI banca + MDD)
+# VISTA: BANCA
 # ======================================================================
 def show_banca():
     st.markdown("### Banca – equity, ROI sobre banca y Maximum Drawdown")
@@ -608,10 +596,9 @@ def show_banca():
     st.markdown("---")
 
     if mov.empty:
-        st.info("No hay movimientos todavía. Inserta al menos el **depósito inicial** para poder calcular la banca.")
+        st.info("No hay movimientos todavía. Inserta al menos el depósito inicial.")
         return
 
-    st.markdown("#### Configuración")
     only_real = st.checkbox("Usar solo apuestas reales (apuesta_real = SI) para el equity", value=True)
 
     equity_df = _compute_equity_curve(movimientos_df=mov, seguimiento_df=seg, only_real=only_real)
@@ -621,16 +608,11 @@ def show_banca():
 
     banca_inicial = float(equity_df.iloc[0]["equity"]) if len(equity_df) > 0 else 0.0
     banca_actual = float(equity_df.iloc[-1]["equity"]) if len(equity_df) > 0 else 0.0
-
     total_profit = float(equity_df.iloc[-1]["profit_cum"]) if "profit_cum" in equity_df.columns else 0.0
     roi_banca = (total_profit / banca_inicial) if banca_inicial > 0 else None
 
-    mdd_pct = None
-    if "drawdown_pct" in equity_df.columns and equity_df["drawdown_pct"].notna().any():
-        mdd_pct = float(equity_df["drawdown_pct"].min())
-    mdd_abs = None
-    if "drawdown_abs" in equity_df.columns and equity_df["drawdown_abs"].notna().any():
-        mdd_abs = float(equity_df["drawdown_abs"].min())
+    mdd_pct = float(equity_df["drawdown_pct"].min()) if "drawdown_pct" in equity_df.columns and equity_df["drawdown_pct"].notna().any() else None
+    mdd_abs = float(equity_df["drawdown_abs"].min()) if "drawdown_abs" in equity_df.columns and equity_df["drawdown_abs"].notna().any() else None
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Banca inicial", f"{banca_inicial:,.2f} €")
@@ -653,73 +635,174 @@ def show_banca():
 
 
 # ======================================================================
-# VISTA: VIX (actualizar + dashboard)
+# VISTA: VIX (NUEVO)
 # ======================================================================
 def show_vix():
-    st.markdown("### VIX – señales diarias (SVIX / UVIX / NEUTRAL)")
+    st.markdown("### VIX – Lectura diaria + señales (SVIX/UVIX)")
 
-    with st.expander("Actualizar datos desde Yahoo Finance"):
-        c1, c2, c3 = st.columns([1, 1, 2])
-        with c1:
-            start = st.date_input("Start", value=pd.Timestamp("2024-01-01").date())
-        with c2:
-            end = st.date_input("End (exclusivo)", value=(pd.Timestamp.today() + pd.Timedelta(days=1)).date())
-        with c3:
-            st.write("Consejo: deja start en 2024-01-01 para tener rolling 252 bien.")
+    # Rango por defecto: suficiente para rolling 252
+    today = pd.Timestamp.today().date()
+    default_start = (pd.Timestamp.today() - pd.Timedelta(days=800)).date()
 
-        if st.button("Actualizar VIX ahora"):
-            try:
-                out = run_vix_pipeline(start=str(start), end=str(end))
-                st.success(f"VIX actualizado. Filas procesadas: {len(out)}")
-            except Exception as e:
-                st.error(f"Error actualizando VIX: {e}")
-                return
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        start = st.date_input("Start", value=default_start)
+    with c2:
+        end = st.date_input("End", value=today)
+    with c3:
+        st.caption("Usa un rango >= ~260 sesiones para que haya percentiles (rolling 252).")
 
-    try:
-        sig = fetch_vix_signal()
-        daily = fetch_vix_daily()
-    except Exception as e:
-        st.error(f"Error leyendo VIX en Supabase: {e}")
-        return
-
-    if sig.empty:
-        st.info("No hay datos en vix_signal todavía. Pulsa “Actualizar VIX ahora”.")
-        return
-
-    sig = sig.sort_values("fecha").copy()
-    last = sig.iloc[-1]
-
-    estado = str(last.get("estado", "NEUTRAL"))
-    motivo = str(last.get("motivo", ""))
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Fecha", str(pd.to_datetime(last.get("fecha")).date()))
-    c2.metric("Estado", estado)
-    c3.metric("VIX", f"{float(last.get('vix')):.2f}" if pd.notna(last.get("vix")) else "—")
-    c4.metric("VXN/VIX", f"{float(last.get('vxn_vix_ratio')):.3f}" if pd.notna(last.get("vxn_vix_ratio")) else "—")
-
-    st.write(f"**Motivo:** {motivo}")
+    if st.button("Actualizar VIX (Yahoo → Supabase)"):
+        try:
+            run_vix_pipeline(start=str(start), end=str(end))
+            st.success("VIX actualizado correctamente.")
+        except Exception as e:
+            st.error(f"Error actualizando VIX: {e}")
 
     st.markdown("---")
-    st.markdown("#### Serie de estados (últimos 90 días)")
-    tail = sig.tail(90).copy()
-    tail["estado"] = tail["estado"].fillna("NEUTRAL")
-    st.dataframe(tail[["fecha", "estado", "vix", "vxn_vix_ratio", "contango_estado", "spy_return", "macro_evento", "motivo"]], use_container_width=True)
 
-    if not daily.empty and "fecha" in daily.columns:
-        daily = daily.sort_values("fecha").copy()
-        st.markdown("#### VIX (nivel) y ratio VXN/VIX")
-        plot = daily[["fecha"]].copy()
-        plot["fecha"] = pd.to_datetime(daily["fecha"], errors="coerce")
-        if "vix" in daily.columns:
-            plot["vix"] = pd.to_numeric(daily["vix"], errors="coerce")
-            st.line_chart(plot.set_index("fecha")[["vix"]], use_container_width=True)
+    # Lectura desde Supabase
+    try:
+        daily = fetch_vix_daily()
+        sig = fetch_vix_signal()
+    except Exception as e:
+        st.error(f"Error leyendo tablas VIX en Supabase: {e}")
+        return
 
-        if "vxn_vix_ratio" in daily.columns:
-            plot2 = daily[["fecha"]].copy()
-            plot2["fecha"] = pd.to_datetime(daily["fecha"], errors="coerce")
-            plot2["vxn_vix_ratio"] = pd.to_numeric(daily["vxn_vix_ratio"], errors="coerce")
-            st.line_chart(plot2.set_index("fecha")[["vxn_vix_ratio"]], use_container_width=True)
+    if sig is not None and not sig.empty:
+        last = sig.dropna(subset=["fecha"]).sort_values("fecha").iloc[-1]
+        st.subheader("Señal más reciente")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Fecha", str(pd.to_datetime(last.get("fecha")).date()) if pd.notna(last.get("fecha")) else "—")
+        c2.metric("Estado", str(last.get("estado") or "—"))
+        c3.metric("VIX", f"{float(last.get('vix')):.2f}" if pd.notna(last.get("vix")) else "—")
+        c4.metric("VXN/VIX", f"{float(last.get('vxn_vix_ratio')):.3f}" if pd.notna(last.get("vxn_vix_ratio")) else "—")
+        st.write(f"**Motivo:** {last.get('motivo') or '—'}")
+    else:
+        st.info("No hay señales aún. Pulsa **Actualizar VIX** para rellenar vix_daily y vix_signal.")
+        return
+
+    # Gráficos
+    if daily is not None and not daily.empty:
+        d = daily.copy()
+        if "fecha" in d.columns:
+            d["fecha"] = pd.to_datetime(d["fecha"], errors="coerce")
+            d = d.dropna(subset=["fecha"]).sort_values("fecha")
+
+        for col in ["vix", "vix_p25", "vix_p65", "vix_p85"]:
+            _safe_numeric(d, col)
+
+        st.markdown("#### VIX vs percentiles (si están disponibles)")
+        cols = [c for c in ["vix", "vix_p25", "vix_p65", "vix_p85"] if c in d.columns]
+        if len(cols) >= 1:
+            st.line_chart(d.set_index("fecha")[cols], use_container_width=True)
+        else:
+            st.info("No hay columnas de VIX/percentiles para graficar.")
+
+        if "contango_estado" in d.columns:
+            st.markdown("#### Contango (conteo)")
+            ct = d["contango_estado"].value_counts(dropna=False).reset_index()
+            ct.columns = ["contango_estado", "n"]
+            st.dataframe(ct, use_container_width=True)
+
+    st.markdown("#### Tabla de señales (últimas 200)")
+    show_sig = sig.copy()
+    if "fecha" in show_sig.columns:
+        show_sig["fecha"] = pd.to_datetime(show_sig["fecha"], errors="coerce")
+        show_sig = show_sig.sort_values("fecha", ascending=False).head(200)
+    st.dataframe(show_sig, use_container_width=True)
+
+
+# ======================================================================
+# VISTA: SUPERVIVENCIA & CONVEXIDAD (+ RAROC charts)
+# ======================================================================
+def show_supervivencia_convexidad():
+    st.markdown("### Supervivencia & Convexidad – Minuto del primer gol (HT)")
+
+    try:
+        df = fetch_seguimiento()
+    except Exception as e:
+        st.error(f"Error cargando datos de seguimiento: {e}")
+        return
+
+    if df.empty:
+        st.info("Todavía no hay datos en 'seguimiento'.")
+        return
+
+    if "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+
+    if "minuto_primer_gol" not in df.columns:
+        st.warning("La tabla 'seguimiento' no tiene la columna 'minuto_primer_gol'.")
+        return
+
+    df["minuto_primer_gol"] = pd.to_numeric(df["minuto_primer_gol"], errors="coerce")
+
+    with st.expander("Filtros"):
+        if "fecha" in df.columns and df["fecha"].notna().any():
+            min_date = df["fecha"].min().date()
+            max_date = df["fecha"].max().date()
+            fecha_desde, fecha_hasta = st.date_input("Rango de fechas", value=(min_date, max_date))
+        else:
+            fecha_desde, fecha_hasta = None, None
+
+        divisiones = sorted([x for x in df.get("division", pd.Series()).dropna().unique()])
+        div_filter = st.multiselect("Filtrar por división", options=divisiones, default=divisiones) if divisiones else []
+
+        pick_types = sorted([x for x in df.get("pick_type", pd.Series()).dropna().unique()])
+        pick_filter = st.multiselect("Filtrar por PickType", options=pick_types, default=pick_types) if pick_types else []
+
+    mask = pd.Series(True, index=df.index)
+    if fecha_desde is not None and "fecha" in df.columns:
+        mask &= df["fecha"].dt.date >= fecha_desde
+    if fecha_hasta is not None and "fecha" in df.columns:
+        mask &= df["fecha"].dt.date <= fecha_hasta
+    if div_filter:
+        mask &= df["division"].isin(div_filter)
+    if pick_filter:
+        mask &= df["pick_type"].isin(pick_filter)
+
+    df_filt = df[mask].copy()
+    if df_filt.empty:
+        st.warning("No hay registros que cumplan los filtros.")
+        return
+
+    minutos = df_filt["minuto_primer_gol"].copy()
+    sin_gol_mask = minutos.isna()
+    total = len(df_filt)
+
+    grid = list(range(0, 46))
+    supervivencia = []
+    for m in grid:
+        vivos = ((minutos > m) | sin_gol_mask).sum()
+        supervivencia.append(vivos / total if total > 0 else 0.0)
+
+    surv_df = pd.DataFrame({"minuto": grid, "supervivencia": supervivencia})
+    st.line_chart(surv_df.set_index("minuto")[["supervivencia"]], use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### RAROC (visualización)")
+
+    work = df_filt.copy()
+    for c in ["stake_btts_no", "stake_u35", "stake_1_1", "profit_euros", "close_minute_global"]:
+        _safe_numeric(work, c)
+
+    work["total_stake"] = _compute_total_stake(work)
+    work["roi_calc"] = _compute_roi_calc(work)
+
+    if "raroc_pct" not in work.columns or work["raroc_pct"].isna().all():
+        work = _compute_raroc(work)
+    else:
+        _safe_numeric(work, "raroc_pct")
+
+    if "fecha" in work.columns and work["fecha"].notna().any():
+        tmp = work.dropna(subset=["fecha"]).copy()
+        tmp["fecha_d"] = pd.to_datetime(tmp["fecha"], errors="coerce").dt.date
+        tmp = tmp[tmp["raroc_pct"].notna()]
+        if not tmp.empty:
+            by_day = tmp.groupby("fecha_d", as_index=False)["raroc_pct"].mean()
+            by_day["fecha_d"] = pd.to_datetime(by_day["fecha_d"])
+            st.line_chart(by_day.set_index("fecha_d")[["raroc_pct"]], use_container_width=True)
 
 
 # ======================================================================
@@ -735,6 +818,7 @@ def main():
             "Selector de partidos",
             "Gestión de apuestas",
             "Estadísticas ROI",
+            "Supervivencia & Convexidad",
             "Banca",
             "VIX",
         ],
@@ -749,6 +833,9 @@ def main():
     elif modo == "Estadísticas ROI":
         st.title("Estadísticas de ROI")
         show_stats()
+    elif modo == "Supervivencia & Convexidad":
+        st.title("Supervivencia & Convexidad")
+        show_supervivencia_convexidad()
     elif modo == "Banca":
         st.title("Banca")
         show_banca()
