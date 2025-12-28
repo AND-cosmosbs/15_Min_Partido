@@ -354,13 +354,8 @@ def compute_states(df_feat: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.Da
 
 def upsert_vix_daily(df: pd.DataFrame) -> int:
     """
-    Upsert en vix_daily (tu esquema).
-    Columns usadas:
-      fecha, vix, vxn, vixy, spy, vxn_vix_ratio,
-      vix_p25, vix_p50, vix_p65, vix_p85,
-      vix_regime,
-      vixy_ma_3, vixy_ma_10,
-      contango_estado
+    Upsert por fecha en vix_daily.
+    Limpia pd.NA/NaN y convierte fechas a str para JSON.
     """
     if df is None or df.empty:
         return 0
@@ -368,29 +363,22 @@ def upsert_vix_daily(df: pd.DataFrame) -> int:
     w = df.copy()
     w["fecha"] = pd.to_datetime(w["date"], errors="coerce").dt.date
 
-    payload = pd.DataFrame({
-        "fecha": w["fecha"],
-        "vix": w.get("vix"),
-        "vxn": w.get("vxn"),
-        "vixy": w.get("vixy"),
-        "spy": w.get("spy"),
+    keep_cols = [
+        "fecha", "vix", "vxn", "vixy", "spy", "spy_ret",
+        "vxn_vix_ratio", "vix_p10", "vix_p25", "vix_p50", "vix_p65", "vix_p85",
+        "vixy_ma3", "vixy_ma10", "contango_ok", "vxn_signal",
+        "macro_tomorrow", "estado", "accion", "comentario",
+    ]
+    w = w[[c for c in keep_cols if c in w.columns]].copy()
 
-        "vxn_vix_ratio": w.get("vxn_vix_ratio"),
+    # ---- limpieza JSON-safe ----
+    # fechas a string
+    w["fecha"] = w["fecha"].apply(lambda x: x.isoformat() if pd.notna(x) else None)
 
-        "vix_p25": w.get("vix_p25"),
-        "vix_p50": w.get("vix_p50"),
-        "vix_p65": w.get("vix_p65"),
-        "vix_p85": w.get("vix_p85"),
+    # NaN/pd.NA -> None
+    w = w.where(pd.notna(w), None)
 
-        "vix_regime": w.get("vix_regime"),
-
-        "vixy_ma_3": w.get("vixy_ma3"),
-        "vixy_ma_10": w.get("vixy_ma10"),
-
-        "contango_estado": w.get("contango_estado"),
-    })
-
-    records = _df_to_records_json_safe(payload)
+    records = w.to_dict(orient="records")
 
     resp = supabase.table("vix_daily").upsert(records, on_conflict="fecha").execute()
     if getattr(resp, "error", None):
