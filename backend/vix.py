@@ -1,9 +1,11 @@
 # backend/vix.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Iterable
 
+import numpy as np
 import pandas as pd
 
 from .supabase_client import supabase
@@ -12,14 +14,15 @@ from .supabase_client import supabase
 # -----------------------------
 # Config
 # -----------------------------
+
 @dataclass
 class VixConfig:
     lookback_pct: int = 252
     ratio_alert: float = 1.30
     ratio_ok: float = 1.25
 
+    # Guardarraíl “VIX demasiado bajo”
     use_guardrail: bool = True
-    guardrail_p10: float = 0.10
     guardrail_vix_floor: float = 12.5  # si VIX < 12.5 => no abrir SVIX
 
 
@@ -27,38 +30,157 @@ DEFAULT_CFG = VixConfig()
 
 
 # -----------------------------
-# Helpers
+# Utilidades robustas
 # -----------------------------
-def _safe_num(s: pd.Series) -> pd.Series:
+
+def _safe_num_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
 
-def _clean_for_json(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convierte NaN/NA -> None y normaliza tipos para que Supabase no rompa:
-    - fechas -> string YYYY-MM-DD cuando toque
-    - boolean -> bool real
-    """
+def _normalize_date_index(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+        return out
 
-    # NaN/NA -> None
-    out = out.where(pd.notna(out), None)
+    # yfinance suele devolver índice Date/Datetime
+    if isinstance(out.index, (pd.DatetimeIndex,)):
+        out = out.reset_index()
+        # el nombre puede ser Date o Datetime
+        if "Date" in out.columns:
+            out.rename(columns={"Date": "date"}, inplace=True)
+        elif "Datetime" in out.columns:
+            out.rename(columns={"Datetime": "date"}, inplace=True)
+        else:
+            # último recurso: primera columna
+            out.rename(columns={out.columns[0]: "date"}, inplace=True)
 
-    # bool pandas -> bool python
-    for c in out.columns:
-        if out[c].dtype == "boolean":
-            out[c] = out[c].astype(object).apply(lambda x: bool(x) if x is not None else None)
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+        return out
 
-    return out
+    # si llega aquí, no hay forma razonable
+    raise RuntimeError("No se pudo detectar columna/índice de fecha en la descarga de Yahoo.")
+
+
+def _pick_close_column(df: pd.DataFrame) -> pd.Series:
+    """
+    yfinance con auto_adjust=True debería traer 'Close'.
+    Pero por robustez, aceptamos varias variantes.
+    """
+    cols = list(df.columns)
+
+    # MultiIndex (a veces)
+    if isinstance(df.columns, pd.MultiIndex):
+        # buscamos nivel que contenga Close
+        if ("Close" in df.columns.get_level_values(0)) or ("close" in df.columns.get_level_values(0)):
+            try:
+                s = df["Close"]
+                # si queda DataFrame (multi ticker), lo reducimos
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                return s
+            except Exception:
+                pass
+
+    # Single index
+    for c in ["Close", "close", "Adj Close", "adjclose", "AdjClose"]:
+        if c in cols:
+            return df[c]
+
+    raise RuntimeError(f"No se encontró columna de cierre en Yahoo. Columnas: {cols}")
+
+
+def _ensure_expected_columns(out: pd.DataFrame, expected: Iterable[str]) -> None:
+    missing = [c for c in expected if c not in out.columns]
+    if missing:
+        raise RuntimeError(
+            "Descarga/merge incompleto. Faltan columnas: "
+            f"{missing}. Columnas presentes: {list(out.columns)}"
+        )
+
+
+def _json_sanitize_value(x: Any) -> Any:
+    """
+    Convierte valores no serializables (NAType, Timestamp, numpy types) a JSON-safe.
+    """
+    if x is None:
+        return None
+
+    # pandas NA/NaN
+    if pd.isna(x):
+        return None
+
+    # fechas
+    if isinstance(x, (pd.Timestamp,)):
+        return x.date().isoformat()
+    if isinstance(x, (pd.datetime,)):
+        return pd.to_datetime(x).date().isoformat()
+    if hasattr(x, "isoformat") and "date" in str(type(x)).lower():
+        # date/datetime
+        try:
+            return x.isoformat()
+        except Exception:
+            return str(x)
+
+    # numpy scalars
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.floating,)):
+        return float(x)
+    if isinstance(x, (np.bool_,)):
+        return bool(x)
+
+    return x
+
+
+def _json_sanitize_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    clean: List[Dict[str, Any]] = []
+    for r in records:
+        clean.append({k: _json_sanitize_value(v) for k, v in r.items()})
+    return clean
 
 
 # -----------------------------
-# Yahoo download
+# Supabase: macro events
 # -----------------------------
+
+def fetch_macro_events() -> pd.DataFrame:
+    """
+    Tabla esperada: macro_events(fecha, label, impacto, activo)
+    """
+    resp = supabase.table("macro_events").select("*").execute()
+    if getattr(resp, "error", None):
+        raise RuntimeError(f"Error leyendo macro_events: {resp.error}")
+
+    data = getattr(resp, "data", None) or []
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    if "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
+    if "activo" in df.columns:
+        df["activo"] = df["activo"].fillna(True)
+    return df
+
+
+def macro_tomorrow_flag(fecha: pd.Timestamp, macro_df: pd.DataFrame) -> bool:
+    if macro_df is None or macro_df.empty:
+        return False
+    tomorrow = (fecha + pd.Timedelta(days=1)).date()
+    w = macro_df.copy()
+    w = w[(w.get("activo", True) == True) & (w["fecha"] == tomorrow)]
+    return len(w) > 0
+
+
+# -----------------------------
+# Yahoo download (robusto)
+# -----------------------------
+
 def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
     """
     Descarga diaria de: ^VIX, ^VXN, VIXY, SPY
-    Devuelve df con columnas: date, vix, vxn, vixy, spy
+    Devuelve columnas: date, vix, vxn, vixy, spy
     """
     import yfinance as yf
 
@@ -79,33 +201,51 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
             interval="1d",
             auto_adjust=True,
             progress=False,
+            group_by="column",
+            actions=False,
         )
+
         if data is None or data.empty:
-            raise RuntimeError(f"No hay datos para {tkr} en Yahoo en rango {start}..{end}")
+            raise RuntimeError(f"No hay datos para {tkr} en Yahoo en el rango {start}..{end}")
 
-        s = data["Close"].copy()
-        s.name = col
+        data = _normalize_date_index(data)
 
-        df = s.reset_index()
-        df.rename(columns={"Date": "date"}, inplace=True)
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+        close = _pick_close_column(data)
+        df_one = pd.DataFrame({"date": data["date"], col: close.values})
+        df_one["date"] = pd.to_datetime(df_one["date"], errors="coerce").dt.normalize()
 
-        out = df if out is None else out.merge(df, on="date", how="outer")
+        if out is None:
+            out = df_one
+        else:
+            out = out.merge(df_one, on="date", how="outer")
 
+    assert out is not None
     out = out.sort_values("date").reset_index(drop=True)
+
+    # garantizamos las columnas esperadas
+    _ensure_expected_columns(out, ["date", "vix", "vxn", "vixy", "spy"])
     return out
 
 
 # -----------------------------
-# Features + estado
+# Señales y estado
 # -----------------------------
+
 def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
     w = df.copy()
 
-    for c in ["vix", "vxn", "vixy", "spy"]:
-        w[c] = _safe_num(w[c])
+    # asegurar columnas base
+    _ensure_expected_columns(w, ["date", "vix", "vxn", "vixy", "spy"])
 
+    w["vix"] = _safe_num_series(w["vix"])
+    w["vxn"] = _safe_num_series(w["vxn"])
+    w["vixy"] = _safe_num_series(w["vixy"])
+    w["spy"] = _safe_num_series(w["spy"])
+
+    # retorno SPY
     w["spy_ret"] = w["spy"].pct_change()
+
+    # ratio VXN/VIX + dirección
     w["vxn_vix_ratio"] = w["vxn"] / w["vix"]
     w["ratio_up"] = w["vxn_vix_ratio"].diff() > 0
 
@@ -116,188 +256,139 @@ def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataF
     w["vix_p65"] = w["vix"].rolling(lb).quantile(0.65)
     w["vix_p85"] = w["vix"].rolling(lb).quantile(0.85)
 
+    # VIXY MA3 vs MA10  (IMPORTANTE: nombres con guión bajo como en tu DB)
     w["vixy_ma_3"] = w["vixy"].rolling(3).mean()
     w["vixy_ma_10"] = w["vixy"].rolling(10).mean()
 
+    w["contango_ok"] = w["vixy_ma_3"] < w["vixy_ma_10"]
     return w
 
 
-def _contango_estado(row: pd.Series) -> Optional[str]:
-    ma3 = row.get("vixy_ma_3")
-    ma10 = row.get("vixy_ma_10")
-    if ma3 is None or ma10 is None:
-        return None
-    try:
-        if ma3 < ma10:
-            return "CONTANGO"
-        if ma3 > ma10:
-            return "BACKWARDATION"
-        return "TRANSICION"
-    except Exception:
-        return None
-
-
-def decide_signal(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, Any]:
-    """
-    Devuelve estado de trading (SVIX/NEUTRAL/UVIX/PREP_SVIX) + motivo.
-    NOTA: aquí no meto macro real (tu tabla macro_events no está en tus SQL finales).
-    """
+def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, Any]:
     vix = row.get("vix")
-    p10 = row.get("vix_p10")
     p25 = row.get("vix_p25")
     p65 = row.get("vix_p65")
     p85 = row.get("vix_p85")
-    ratio = row.get("vxn_vix_ratio")
-    ratio_up = bool(row.get("ratio_up")) if row.get("ratio_up") is not None else False
-    spy_ret = row.get("spy_ret")
 
-    # sin percentiles todavía
-    if vix is None or p25 is None or p65 is None or p85 is None:
-        return {"estado": "NEUTRAL", "motivo": "Insuficiente histórico (rolling 252 no disponible aún)."}
+    ratio = row.get("vxn_vix_ratio")
+    ratio_up = bool(row.get("ratio_up")) if pd.notna(row.get("ratio_up")) else False
+    contango_ok = bool(row.get("contango_ok")) if pd.notna(row.get("contango_ok")) else False
+    spy_ret = row.get("spy_ret")
+    macro_tomorrow = bool(row.get("macro_tomorrow")) if pd.notna(row.get("macro_tomorrow")) else False
+
+    # sin percentiles aún => no operar
+    if pd.isna(p25) or pd.isna(p65) or pd.isna(p85) or pd.isna(vix):
+        return {"estado": "NEUTRAL", "accion": "NO DATA", "comentario": "Insuficiente histórico para rolling 252."}
 
     # guardarraíl VIX demasiado bajo
-    if cfg.use_guardrail:
-        too_low_by_p10 = (p10 is not None and vix < p10)
-        too_low_by_floor = (vix is not None and vix < cfg.guardrail_vix_floor)
-        if too_low_by_p10 or too_low_by_floor:
-            return {"estado": "NEUTRAL", "motivo": "Guardarraíl: VIX extremadamente bajo (snapback risk)."}
+    if cfg.use_guardrail and pd.notna(vix) and float(vix) < float(cfg.guardrail_vix_floor):
+        return {
+            "estado": "NEUTRAL",
+            "accion": "NO OPEN SVIX",
+            "comentario": "Guardarraíl: VIX extremadamente bajo (riesgo snapback).",
+        }
 
-    cont_estado = _contango_estado(row)
-    contango_ok = (cont_estado == "CONTANGO")
+    # SVIX (todas)
+    cond_svix = (
+        (vix < p25)
+        and (pd.notna(ratio) and ratio < cfg.ratio_ok)
+        and contango_ok
+        and (macro_tomorrow is False)
+    )
+    if cond_svix:
+        return {"estado": "SVIX", "accion": "OPEN/HOLD SVIX", "comentario": "Calma + contango + sin macro mañana."}
 
-    # SVIX
-    if (vix < p25) and (ratio is not None and ratio < cfg.ratio_ok) and contango_ok:
-        return {"estado": "SVIX", "motivo": "VIX < P25 + ratio VXN/VIX OK + contango estable."}
+    # UVIX (mínimo 2)
+    uvix_cond1 = vix > p65
+    uvix_cond2 = (pd.notna(ratio) and ratio > cfg.ratio_alert and ratio_up)
+    uvix_cond3 = (pd.notna(row.get("vixy_ma_3")) and pd.notna(row.get("vixy_ma_10")) and (row.get("vixy_ma_3") > row.get("vixy_ma_10")))
+    uvix_cond4 = (pd.notna(spy_ret) and spy_ret < -0.008)
 
-    # UVIX (2 de 4)
-    uv1 = vix > p65
-    uv2 = (ratio is not None and ratio > cfg.ratio_alert and ratio_up)
-    uv3 = (cont_estado == "BACKWARDATION")
-    uv4 = (spy_ret is not None and spy_ret < -0.008)
-    score = sum([bool(uv1), bool(uv2), bool(uv3), bool(uv4)])
+    uvix_score = sum([bool(uvix_cond1), bool(uvix_cond2), bool(uvix_cond3), bool(uvix_cond4)])
+    if uvix_score >= 2:
+        return {"estado": "UVIX", "accion": "TRADE UVIX (SHORT)", "comentario": f"Stress score={uvix_score}."}
 
-    if score >= 2:
-        return {"estado": "UVIX", "motivo": f"Stress score={score} (VIX/ratio/contango/SPY)."}
+    # Purple: pánico agotándose
+    cond_purple = (vix > p85) and (ratio_up is False) and contango_ok
+    if cond_purple:
+        return {"estado": "PREP_SVIX", "accion": "CLOSE UVIX / PREPARE SVIX", "comentario": "Pánico se agota + contango vuelve."}
 
-    # PREP_SVIX
-    if (vix > p85) and (ratio_up is False) and contango_ok:
-        return {"estado": "PREP_SVIX", "motivo": "Pánico agotándose + contango vuelve (preparar SVIX)."}
-
-    return {"estado": "NEUTRAL", "motivo": "Régimen mixto / transición."}
+    return {"estado": "NEUTRAL", "accion": "NO NEW POSITION", "comentario": "Régimen mixto / transición."}
 
 
-def compute_all(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
-    w = compute_features(df, cfg=cfg)
+def compute_states(df_feat: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
+    w = df_feat.copy()
 
-    # columnas de salida “daily”
-    w["contango_estado"] = w.apply(_contango_estado, axis=1)
+    macro = fetch_macro_events()
+    w["macro_tomorrow"] = w["date"].apply(
+        lambda d: macro_tomorrow_flag(pd.to_datetime(d), macro) if pd.notna(d) else False
+    )
 
-    # señal diaria (para vix_signal)
-    sig_estado: List[str] = []
-    sig_motivo: List[str] = []
+    estados, acciones, comentarios = [], [], []
     for _, r in w.iterrows():
-        res = decide_signal(r, cfg=cfg)
-        sig_estado.append(res["estado"])
-        sig_motivo.append(res["motivo"])
+        res = decide_state_row(r, cfg=cfg)
+        estados.append(res["estado"])
+        acciones.append(res["accion"])
+        comentarios.append(res["comentario"])
 
-    w["signal_estado"] = sig_estado
-    w["signal_motivo"] = sig_motivo
-
+    w["estado"] = estados
+    w["accion"] = acciones
+    w["comentario"] = comentarios
     return w
 
 
 # -----------------------------
-# Supabase write/read
+# Supabase: vix_daily (única tabla)
 # -----------------------------
-def upsert_vix_daily(df_all: pd.DataFrame) -> int:
-    """
-    Escribe en public.vix_daily (solo columnas existentes en tu tabla).
-    """
-    if df_all is None or df_all.empty:
+
+def upsert_vix_daily(df: pd.DataFrame) -> int:
+    if df.empty:
         return 0
 
-    w = df_all.copy()
-    w["fecha"] = pd.to_datetime(w["date"], errors="coerce").dt.date.astype(str)
+    w = df.copy()
+    w["fecha"] = pd.to_datetime(w["date"], errors="coerce").dt.date
 
-    keep = [
+    keep_cols = [
         "fecha",
         "vix", "vxn", "vixy", "spy",
+        "spy_ret",
         "vxn_vix_ratio",
         "vix_p10", "vix_p25", "vix_p50", "vix_p65", "vix_p85",
         "vixy_ma_3", "vixy_ma_10",
-        "contango_estado",
-        "spy_ret",
-        "macro_tomorrow",  # si existe
+        "contango_ok",
+        "macro_tomorrow",
+        "estado", "accion", "comentario",
     ]
-    w = w[[c for c in keep if c in w.columns]].copy()
-    w = _clean_for_json(w)
+    w = w[[c for c in keep_cols if c in w.columns]].copy()
 
-    records = w.to_dict(orient="records")
+    records: List[Dict[str, Any]] = w.to_dict(orient="records")
+    records = _json_sanitize_records(records)
+
     resp = supabase.table("vix_daily").upsert(records, on_conflict="fecha").execute()
     if getattr(resp, "error", None):
-        raise RuntimeError(f"Error upsert vix_daily: {resp.error}")
-    return len(records)
+        raise RuntimeError(resp.error)
 
-
-def upsert_vix_signal(df_all: pd.DataFrame) -> int:
-    """
-    Escribe en public.vix_signal (TABLA, no VIEW).
-    """
-    if df_all is None or df_all.empty:
-        return 0
-
-    w = df_all.copy()
-    w["fecha"] = pd.to_datetime(w["date"], errors="coerce").dt.date.astype(str)
-
-    out = pd.DataFrame({
-        "fecha": w["fecha"],
-        "estado": w["signal_estado"],
-        "motivo": w["signal_motivo"],
-        "vix": w.get("vix"),
-        "vxn_vix_ratio": w.get("vxn_vix_ratio"),
-        "contango_estado": w.get("contango_estado"),
-        "spy_return": w.get("spy_ret"),
-        "macro_evento": w.get("macro_tomorrow", False),
-    })
-
-    out = _clean_for_json(out)
-
-    records = out.to_dict(orient="records")
-    resp = supabase.table("vix_signal").upsert(records, on_conflict="fecha").execute()
-    if getattr(resp, "error", None):
-        raise RuntimeError(f"Error upsert vix_signal: {resp.error}")
     return len(records)
 
 
 def fetch_vix_daily() -> pd.DataFrame:
     resp = supabase.table("vix_daily").select("*").order("fecha", desc=False).execute()
     if getattr(resp, "error", None):
-        raise RuntimeError(f"Error leyendo vix_daily: {resp.error}")
-    df = pd.DataFrame(getattr(resp, "data", None) or [])
-    if not df.empty and "fecha" in df.columns:
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-    return df
-
-
-def fetch_vix_signal() -> pd.DataFrame:
-    resp = supabase.table("vix_signal").select("*").order("fecha", desc=False).execute()
-    if getattr(resp, "error", None):
-        raise RuntimeError(f"Error leyendo vix_signal: {resp.error}")
-    df = pd.DataFrame(getattr(resp, "data", None) or [])
+        raise RuntimeError(resp.error)
+    data = getattr(resp, "data", None) or []
+    df = pd.DataFrame(data)
     if not df.empty and "fecha" in df.columns:
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
     return df
 
 
 # -----------------------------
-# Pipeline
+# Pipeline 1-click
 # -----------------------------
+
 def run_vix_pipeline(start: str, end: str, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
     raw = download_yahoo_daily(start=start, end=end)
-    all_df = compute_all(raw, cfg=cfg)
-
-    # escribe a tablas (vix_daily + vix_signal)
-    upsert_vix_daily(all_df)
-    upsert_vix_signal(all_df)
-
-    return all_df
+    feat = compute_features(raw, cfg=cfg)
+    out = compute_states(feat, cfg=cfg)
+    upsert_vix_daily(out)
+    return out
