@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Iterable
+import datetime as dt
 
 import numpy as np
 import pandas as pd
@@ -71,11 +72,9 @@ def _pick_close_column(df: pd.DataFrame) -> pd.Series:
 
     # MultiIndex (a veces)
     if isinstance(df.columns, pd.MultiIndex):
-        # buscamos nivel que contenga Close
         if ("Close" in df.columns.get_level_values(0)) or ("close" in df.columns.get_level_values(0)):
             try:
                 s = df["Close"]
-                # si queda DataFrame (multi ticker), lo reducimos
                 if isinstance(s, pd.DataFrame):
                     s = s.iloc[:, 0]
                 return s
@@ -101,22 +100,32 @@ def _ensure_expected_columns(out: pd.DataFrame, expected: Iterable[str]) -> None
 
 def _json_sanitize_value(x: Any) -> Any:
     """
-    Convierte valores no serializables (NAType, Timestamp, numpy types) a JSON-safe.
+    Convierte valores no serializables (NAType, Timestamp, numpy types, date/datetime) a JSON-safe.
     """
     if x is None:
         return None
 
     # pandas NA/NaN
-    if pd.isna(x):
-        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        # si pd.isna() revienta con algún tipo raro, seguimos
+        pass
 
-    # fechas
-    if isinstance(x, (pd.Timestamp,)):
-        return x.date().isoformat()
-    if isinstance(x, (pd.datetime,)):
-        return pd.to_datetime(x).date().isoformat()
-    if hasattr(x, "isoformat") and "date" in str(type(x)).lower():
-        # date/datetime
+    # pandas Timestamp / numpy datetime64 / python date/datetime
+    if isinstance(x, pd.Timestamp):
+        if pd.isna(x):
+            return None
+        return x.to_pydatetime().date().isoformat()
+
+    if isinstance(x, np.datetime64):
+        try:
+            return pd.to_datetime(x).to_pydatetime().date().isoformat()
+        except Exception:
+            return str(x)
+
+    if isinstance(x, (dt.datetime, dt.date)):
         try:
             return x.isoformat()
         except Exception:
@@ -130,6 +139,7 @@ def _json_sanitize_value(x: Any) -> Any:
     if isinstance(x, (np.bool_,)):
         return bool(x)
 
+    # python floats/ints/bools/strings ya son JSON-safe
     return x
 
 
@@ -222,7 +232,6 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
     assert out is not None
     out = out.sort_values("date").reset_index(drop=True)
 
-    # garantizamos las columnas esperadas
     _ensure_expected_columns(out, ["date", "vix", "vxn", "vixy", "spy"])
     return out
 
@@ -234,7 +243,6 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
 def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
     w = df.copy()
 
-    # asegurar columnas base
     _ensure_expected_columns(w, ["date", "vix", "vxn", "vixy", "spy"])
 
     w["vix"] = _safe_num_series(w["vix"])
@@ -242,10 +250,8 @@ def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataF
     w["vixy"] = _safe_num_series(w["vixy"])
     w["spy"] = _safe_num_series(w["spy"])
 
-    # retorno SPY
     w["spy_ret"] = w["spy"].pct_change()
 
-    # ratio VXN/VIX + dirección
     w["vxn_vix_ratio"] = w["vxn"] / w["vix"]
     w["ratio_up"] = w["vxn_vix_ratio"].diff() > 0
 
@@ -256,7 +262,6 @@ def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataF
     w["vix_p65"] = w["vix"].rolling(lb).quantile(0.65)
     w["vix_p85"] = w["vix"].rolling(lb).quantile(0.85)
 
-    # VIXY MA3 vs MA10  (IMPORTANTE: nombres con guión bajo como en tu DB)
     w["vixy_ma_3"] = w["vixy"].rolling(3).mean()
     w["vixy_ma_10"] = w["vixy"].rolling(10).mean()
 
@@ -276,11 +281,9 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
     spy_ret = row.get("spy_ret")
     macro_tomorrow = bool(row.get("macro_tomorrow")) if pd.notna(row.get("macro_tomorrow")) else False
 
-    # sin percentiles aún => no operar
     if pd.isna(p25) or pd.isna(p65) or pd.isna(p85) or pd.isna(vix):
         return {"estado": "NEUTRAL", "accion": "NO DATA", "comentario": "Insuficiente histórico para rolling 252."}
 
-    # guardarraíl VIX demasiado bajo
     if cfg.use_guardrail and pd.notna(vix) and float(vix) < float(cfg.guardrail_vix_floor):
         return {
             "estado": "NEUTRAL",
@@ -288,7 +291,6 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
             "comentario": "Guardarraíl: VIX extremadamente bajo (riesgo snapback).",
         }
 
-    # SVIX (todas)
     cond_svix = (
         (vix < p25)
         and (pd.notna(ratio) and ratio < cfg.ratio_ok)
@@ -298,7 +300,6 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
     if cond_svix:
         return {"estado": "SVIX", "accion": "OPEN/HOLD SVIX", "comentario": "Calma + contango + sin macro mañana."}
 
-    # UVIX (mínimo 2)
     uvix_cond1 = vix > p65
     uvix_cond2 = (pd.notna(ratio) and ratio > cfg.ratio_alert and ratio_up)
     uvix_cond3 = (pd.notna(row.get("vixy_ma_3")) and pd.notna(row.get("vixy_ma_10")) and (row.get("vixy_ma_3") > row.get("vixy_ma_10")))
@@ -308,7 +309,6 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
     if uvix_score >= 2:
         return {"estado": "UVIX", "accion": "TRADE UVIX (SHORT)", "comentario": f"Stress score={uvix_score}."}
 
-    # Purple: pánico agotándose
     cond_purple = (vix > p85) and (ratio_up is False) and contango_ok
     if cond_purple:
         return {"estado": "PREP_SVIX", "accion": "CLOSE UVIX / PREPARE SVIX", "comentario": "Pánico se agota + contango vuelve."}
