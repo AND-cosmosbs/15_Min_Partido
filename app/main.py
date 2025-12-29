@@ -696,7 +696,7 @@ def show_vix():
             run_vix_pipeline(start=str(start), end=str(end))
             st.success("VIX actualizado y guardado en Supabase (vix_daily).")
         except Exception as e:
-            st.error(f"Error actualizando VIX: {e}")
+    st.exception(e)
 
     st.markdown("---")
 
