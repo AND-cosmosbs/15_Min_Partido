@@ -680,7 +680,7 @@ def show_banca():
 
 
 # ======================================================================
-# VISTA: VIX (robusta: solo vix_daily)
+# VISTA: VIX (robusta: solo vix_daily) + explicación
 # ======================================================================
 def show_vix():
     st.markdown("### VIX – régimen diario (SVIX / NEUTRAL / UVIX)")
@@ -689,17 +689,14 @@ def show_vix():
     with c1:
         start = st.date_input("Start", value=pd.Timestamp("2025-01-01").date())
     with c2:
-        # ✅ date_input SIEMPRE con date, no Timestamp
-        end_default = (pd.Timestamp.today() + pd.Timedelta(days=1)).date()
-        end = st.date_input("End (exclusivo)", value=end_default)
+        end = st.date_input("End (exclusivo)", value=(pd.Timestamp.today().date() + pd.Timedelta(days=1)))
 
     if st.button("Actualizar VIX (descargar + calcular + guardar en Supabase)"):
         try:
             run_vix_pipeline(start=str(start), end=str(end))
             st.success("VIX actualizado y guardado en Supabase (vix_daily).")
         except Exception as e:
-            # ✅ BLOQUE INDENTADO (sin IndentationError)
-            st.error(f"Error actualizando VIX: {e}")
+            # ✅ Esto te enseña el traceback en Streamlit (plan gratuito)
             st.exception(e)
 
     st.markdown("---")
@@ -722,17 +719,81 @@ def show_vix():
         st.error("vix_daily no tiene columna 'fecha'.")
         return
 
+    # --- Último estado / mensaje claro del día ---
     last = daily.iloc[-1]
+    last_date = last.get("fecha")
+    last_date_str = str(last_date.date()) if pd.notna(last_date) else "—"
 
-    st.markdown("#### Último estado")
-    st.metric("Fecha", str(last.get("fecha").date()) if pd.notna(last.get("fecha")) else "—")
-    st.metric("Estado", str(last.get("estado", "—")))
-    st.write(f"**Acción:** {last.get('accion', '')}")
-    st.write(f"**Comentario:** {last.get('comentario', '')}")
+    estado = str(last.get("estado", "—"))
+    accion = str(last.get("accion", "—"))
+    comentario = str(last.get("comentario", ""))
 
+    st.markdown("#### Señal del día (último registro)")
+    cA, cB, cC = st.columns(3)
+    cA.metric("Fecha", last_date_str)
+    cB.metric("Estado", estado)
+    cC.metric("Acción", accion)
+    if comentario:
+        st.info(f"**Por qué:** {comentario}")
+
+    # --- Explicación “por qué” con inputs concretos (si existen) ---
+    st.markdown("#### Inputs usados para la decisión (foto del día)")
+    keys = [
+        ("VIX", "vix"),
+        ("VXN/VIX", "vxn_vix_ratio"),
+        ("Contango OK", "contango_ok"),
+        ("Macro mañana", "macro_tomorrow"),
+        ("SPY ret (día)", "spy_ret"),
+        ("P25 VIX", "vix_p25"),
+        ("P65 VIX", "vix_p65"),
+        ("P85 VIX", "vix_p85"),
+        ("MA3 VXX/VIXY", "vixy_ma_3"),
+        ("MA10 VXX/VIXY", "vixy_ma_10"),
+    ]
+
+    cols = st.columns(3)
+    i = 0
+    for label, colname in keys:
+        if colname in daily.columns:
+            val = last.get(colname)
+            # formateos
+            if isinstance(val, (float, int)) and pd.notna(val):
+                if "ret" in colname:
+                    disp = f"{val*100:.2f}%"
+                elif "OK" in label or colname in ("contango_ok", "macro_tomorrow"):
+                    disp = str(bool(val))
+                else:
+                    disp = f"{val:.4f}" if abs(float(val)) < 100 else f"{val:.2f}"
+            else:
+                disp = "—" if pd.isna(val) else str(val)
+            cols[i % 3].metric(label, disp)
+            i += 1
+
+    # --- Confirmación / cooldown (solo mostrar si hay columnas) ---
     st.markdown("---")
+    st.markdown("#### Ruido (confirmación / cooldown)")
+    st.caption(
+        "Si tu `vix.py` aplica confirmación (p. ej. 2 días) o cooldown (p. ej. 3 días), "
+        "suele reflejarse en columnas adicionales. Aquí te las muestro si existen."
+    )
 
-    # Charts (solo si existen columnas)
+    possible_cols = [
+        "raw_estado", "raw_accion",
+        "estado_raw", "accion_raw",
+        "estado_confirmado", "accion_confirmada",
+        "estado_final", "accion_final",
+        "cooldown", "cooldown_days",
+        "confirm_days", "confirmacion_dias",
+    ]
+    present_extra = [c for c in possible_cols if c in daily.columns]
+    if present_extra:
+        show = ["fecha"] + present_extra
+        st.dataframe(daily[show].sort_values("fecha", ascending=False).head(30), use_container_width=True)
+    else:
+        st.info("No veo columnas de confirmación/cooldown en vix_daily. Si están implementados, dime cómo se llaman y los mostramos.")
+
+    # --- Charts ---
+    st.markdown("---")
     for col in ["vix", "vxn_vix_ratio", "vixy_ma_3", "vixy_ma_10"]:
         _safe_numeric(daily, col)
 
@@ -743,11 +804,23 @@ def show_vix():
     if "vxn_vix_ratio" in daily.columns:
         st.markdown("#### Ratio VXN/VIX")
         st.line_chart(daily.set_index("fecha")[["vxn_vix_ratio"]], use_container_width=True)
+        st.caption(
+            "📌 **Qué significa:** VXN es la volatilidad implícita del Nasdaq-100; VIX la del S&P 500. "
+            "Cuando **VXN/VIX sube**, suele indicar que el mercado está pagando más por protección en tecnología "
+            "que en el índice amplio: a veces es señal de estrés *selectivo* o de rotación defensiva."
+        )
 
-    cols = [c for c in ["vixy_ma_3", "vixy_ma_10"] if c in daily.columns]
-    if cols:
-        st.markdown("#### Contango proxy (VIXY MA3 vs MA10)")
-        st.line_chart(daily.set_index("fecha")[cols], use_container_width=True)
+    cols_ctg = [c for c in ["vixy_ma_3", "vixy_ma_10"] if c in daily.columns]
+    if cols_ctg:
+        st.markdown("#### Contango proxy (MA3 vs MA10 del ETF de volatilidad)")
+        st.line_chart(daily.set_index("fecha")[cols_ctg], use_container_width=True)
+        st.caption(
+            "📌 **Qué significa:** Usamos un proxy del comportamiento del ‘carry’ en productos de volatilidad. "
+            "Cuando la **media corta (MA3) está por debajo de la larga (MA10)** solemos interpretarlo como "
+            "un régimen más ‘estable’ (menos estrés inmediato). Si **MA3 > MA10**, puede indicar tensión / backwardation proxy."
+        )
+    else:
+        st.warning("No hay columnas de MA3/MA10 disponibles en vix_daily para el gráfico de contango.")
 
     st.markdown("#### Tabla (vix_daily)")
     show_cols = [c for c in [
@@ -757,6 +830,7 @@ def show_vix():
         "vix_p25", "vix_p65", "vix_p85",
         "vixy_ma_3", "vixy_ma_10",
         "spy_ret",
+        "raw_estado", "raw_accion", "estado_final", "accion_final", "accion_confirmada", "estado_confirmado",
     ] if c in daily.columns]
     st.dataframe(daily[show_cols].sort_values("fecha", ascending=False), use_container_width=True)
 
