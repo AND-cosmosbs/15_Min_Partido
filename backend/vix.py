@@ -197,7 +197,7 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
     tickers = {
         "^VIX": "vix",
         "^VXN": "vxn",
-        "VIXY": "vixy",
+        "VXX": "vixy",
         "SPY": "spy",
     }
 
