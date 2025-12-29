@@ -689,14 +689,18 @@ def show_vix():
     with c1:
         start = st.date_input("Start", value=pd.Timestamp("2025-01-01").date())
     with c2:
-        end = st.date_input("End (exclusivo)", value=(pd.Timestamp.today().date() + pd.Timedelta(days=1)))
+        # ✅ date_input SIEMPRE con date, no Timestamp
+        end_default = (pd.Timestamp.today() + pd.Timedelta(days=1)).date()
+        end = st.date_input("End (exclusivo)", value=end_default)
 
     if st.button("Actualizar VIX (descargar + calcular + guardar en Supabase)"):
         try:
             run_vix_pipeline(start=str(start), end=str(end))
             st.success("VIX actualizado y guardado en Supabase (vix_daily).")
         except Exception as e:
-    st.exception(e)
+            # ✅ BLOQUE INDENTADO (sin IndentationError)
+            st.error(f"Error actualizando VIX: {e}")
+            st.exception(e)
 
     st.markdown("---")
 
