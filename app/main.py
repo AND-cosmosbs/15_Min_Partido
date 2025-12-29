@@ -755,7 +755,7 @@ def show_vix():
         "vix", "vxn", "vixy", "spy",
         "vxn_vix_ratio", "contango_ok", "macro_tomorrow",
         "vix_p25", "vix_p65", "vix_p85",
-        "vixy_ma3", "vixy_ma10",
+        "vixy_ma_3", "vixy_ma_10",
         "spy_ret",
     ] if c in daily.columns]
     st.dataframe(daily[show_cols].sort_values("fecha", ascending=False), use_container_width=True)
