@@ -733,7 +733,7 @@ def show_vix():
     st.markdown("---")
 
     # Charts (solo si existen columnas)
-    for col in ["vix", "vxn_vix_ratio", "vixy_ma3", "vixy_ma10"]:
+    for col in ["vix", "vxn_vix_ratio", "vixy_ma_3", "vixy_ma_10"]:
         _safe_numeric(daily, col)
 
     if "vix" in daily.columns:
@@ -744,7 +744,7 @@ def show_vix():
         st.markdown("#### Ratio VXN/VIX")
         st.line_chart(daily.set_index("fecha")[["vxn_vix_ratio"]], use_container_width=True)
 
-    cols = [c for c in ["vixy_ma3", "vixy_ma10"] if c in daily.columns]
+    cols = [c for c in ["vixy_ma_3", "vixy_ma_10"] if c in daily.columns]
     if cols:
         st.markdown("#### Contango proxy (VIXY MA3 vs MA10)")
         st.line_chart(daily.set_index("fecha")[cols], use_container_width=True)
