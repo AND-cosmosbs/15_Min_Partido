@@ -543,3 +543,63 @@ def run_vix_pipeline(start: str, end: str, cfg: VixConfig = DEFAULT_CFG) -> pd.D
     out = compute_states(feat, cfg=cfg)
     upsert_vix_daily(out)
     return out
+# -----------------------------
+# Orders: vix_orders
+# -----------------------------
+
+def fetch_vix_orders(limit: int = 200) -> pd.DataFrame:
+    resp = (
+        supabase.table("vix_orders")
+        .select("*")
+        .order("fecha", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    if getattr(resp, "error", None):
+        raise RuntimeError(resp.error)
+
+    data = getattr(resp, "data", None) or []
+    df = pd.DataFrame(data)
+    if not df.empty and "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    return df
+
+
+def insert_vix_order(
+    fecha,
+    ticker: str,
+    side: str,
+    qty: float,
+    price: Optional[float] = None,
+    status: str = "PLANNED",
+    notes: Optional[str] = None,
+    estado_signal: Optional[str] = None,
+) -> None:
+    rec = {
+        "fecha": str(pd.to_datetime(fecha).date()),
+        "estado_signal": estado_signal,
+        "ticker": ticker,
+        "side": side,
+        "qty": float(qty),
+        "price": float(price) if price is not None else None,
+        "status": status,
+        "notes": notes,
+    }
+    rec = {k: _json_sanitize_value(v) for k, v in rec.items()}
+
+    resp = supabase.table("vix_orders").insert(rec).execute()
+    if getattr(resp, "error", None):
+        raise RuntimeError(resp.error)
+
+
+def update_vix_order_status(order_id: int, status: str, price: Optional[float] = None, notes: Optional[str] = None) -> None:
+    payload = {"status": status}
+    if price is not None:
+        payload["price"] = float(price)
+    if notes is not None:
+        payload["notes"] = notes
+    payload = {k: _json_sanitize_value(v) for k, v in payload.items()}
+
+    resp = supabase.table("vix_orders").update(payload).eq("id", int(order_id)).execute()
+    if getattr(resp, "error", None):
+        raise RuntimeError(resp.error)
