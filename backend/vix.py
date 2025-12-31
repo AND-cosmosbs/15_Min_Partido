@@ -78,6 +78,43 @@ def _pick_close_column(df: pd.DataFrame) -> pd.Series:
     raise RuntimeError(f"No se encontró columna de cierre en Yahoo. Columnas: {cols}")
 
 
+def _pick_ohlc_field(df: pd.DataFrame, field: str) -> pd.Series:
+    """
+    Devuelve una Series 1D para Open/High/Low/Close aunque yfinance devuelva MultiIndex.
+    """
+    if field not in ["Open", "High", "Low", "Close"]:
+        raise ValueError(f"Campo OHLC inválido: {field}")
+
+    # Caso normal: columnas simples
+    if not isinstance(df.columns, pd.MultiIndex):
+        if field not in df.columns:
+            raise RuntimeError(f"No existe columna {field}. Columnas: {list(df.columns)}")
+        s = df[field]
+        if isinstance(s, pd.DataFrame):
+            # ultra-robusto: si viniera DataFrame, cogemos la primera
+            s = s.iloc[:, 0]
+        return s
+
+    # MultiIndex: normalmente nivel 0 = OHLC
+    lvl0 = df.columns.get_level_values(0)
+    if field in set(lvl0):
+        sub = df[field]  # puede ser Series o DataFrame
+        if isinstance(sub, pd.Series):
+            return sub
+        if isinstance(sub, pd.DataFrame):
+            return sub.iloc[:, 0]
+
+    # Fallback: buscar por nombre exacto en tuples
+    for col in df.columns:
+        if isinstance(col, tuple) and len(col) > 0 and col[0] == field:
+            s = df[col]
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            return s
+
+    raise RuntimeError(f"No pude extraer {field} de columnas MultiIndex: {df.columns}")
+
+
 def _ensure_expected_columns(out: pd.DataFrame, expected: Iterable[str]) -> None:
     missing = [c for c in expected if c not in out.columns]
     if missing:
@@ -191,7 +228,7 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
         data = _normalize_date_index(data)
 
         close = _pick_close_column(data)
-        df_one = pd.DataFrame({"date": data["date"], col: close.values})
+        df_one = pd.DataFrame({"date": data["date"], col: pd.to_numeric(close, errors="coerce").values})
         df_one["date"] = pd.to_datetime(df_one["date"], errors="coerce").dt.normalize()
 
         if out is None:
@@ -236,19 +273,19 @@ def download_trade_ohlc(start: str, end: str) -> pd.DataFrame:
 
         data = _normalize_date_index(data)
 
-        # yfinance típico trae Open/High/Low/Close
-        for needed in ["Open", "High", "Low", "Close"]:
-            if needed not in data.columns:
-                raise RuntimeError(f"{tkr} no trae columna {needed}. Columnas: {list(data.columns)}")
+        # Extraer Series 1D aunque venga MultiIndex
+        o = _pick_ohlc_field(data, "Open")
+        h = _pick_ohlc_field(data, "High")
+        l = _pick_ohlc_field(data, "Low")
+        c = _pick_ohlc_field(data, "Close")
 
         df_one = pd.DataFrame({
-            "date": data["date"],
-            f"{prefix}_open": pd.to_numeric(data["Open"], errors="coerce").values,
-            f"{prefix}_high": pd.to_numeric(data["High"], errors="coerce").values,
-            f"{prefix}_low": pd.to_numeric(data["Low"], errors="coerce").values,
-            f"{prefix}_close": pd.to_numeric(data["Close"], errors="coerce").values,
+            "date": pd.to_datetime(data["date"], errors="coerce").dt.normalize(),
+            f"{prefix}_open": pd.to_numeric(o, errors="coerce").astype(float).values,
+            f"{prefix}_high": pd.to_numeric(h, errors="coerce").astype(float).values,
+            f"{prefix}_low": pd.to_numeric(l, errors="coerce").astype(float).values,
+            f"{prefix}_close": pd.to_numeric(c, errors="coerce").astype(float).values,
         })
-        df_one["date"] = pd.to_datetime(df_one["date"], errors="coerce").dt.normalize()
 
         if out is None:
             out = df_one
