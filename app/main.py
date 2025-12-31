@@ -2,6 +2,7 @@
 
 import os
 import sys
+import io
 import pandas as pd
 import streamlit as st
 
@@ -28,25 +29,14 @@ from backend.banca import (  # type: ignore
     insert_banca_movimiento,
 )
 
-# ✅ VIX (solo vix_daily)
+# ✅ VIX (vix_daily + órdenes)
 from backend.vix import (  # type: ignore
     run_vix_pipeline,
     fetch_vix_daily,
+    fetch_vix_orders,
+    insert_vix_order,
+    update_vix_order_status,
 )
-
-# ✅ Órdenes VIX (si existen en tu backend/vix.py; si no, no rompe)
-try:
-    from backend.vix import (  # type: ignore
-        fetch_vix_orders,
-        insert_vix_order,
-        update_vix_order_status,
-    )
-    _VIX_ORDERS_AVAILABLE = True
-except Exception:
-    fetch_vix_orders = None
-    insert_vix_order = None
-    update_vix_order_status = None
-    _VIX_ORDERS_AVAILABLE = False
 
 
 # ---------- CARGA HISTÓRICO (CACHEADO) ----------
@@ -382,10 +372,7 @@ def show_gestion():
     editable_cols = [c for c in base_editable if c in filtered.columns]
 
     if "fecha" in filtered.columns:
-        # si no existe hora/division/home_team no rompe
-        sort_cols = [c for c in ["fecha", "hora", "division", "home_team"] if c in filtered.columns]
-        if sort_cols:
-            filtered = filtered.sort_values(sort_cols, na_position="last")
+        filtered = filtered.sort_values(["fecha", "hora", "division", "home_team"], na_position="last")
 
     st.markdown("#### Edición rápida (tabla)")
     edited = st.data_editor(filtered, use_container_width=True, key="editor_seguimiento", hide_index=True)
@@ -588,7 +575,6 @@ def show_stats():
         work = df.copy()
         work["fecha_d"] = pd.to_datetime(work["fecha"], errors="coerce").dt.date
 
-        # cruzamos por fecha
         if "estado" in v.columns:
             work = work.merge(
                 v[["fecha", "estado"]].rename(columns={"fecha": "fecha_d", "estado": "vix_estado"}),
@@ -608,7 +594,10 @@ def show_stats():
                 }))
                 .reset_index()
             )
-            grp["roi_pct"] = grp.apply(lambda r: (r["profit_total"] / r["stake_total"] * 100.0) if r["stake_total"] > 0 else 0.0, axis=1)
+            grp["roi_pct"] = grp.apply(
+                lambda r: (r["profit_total"] / r["stake_total"] * 100.0) if r["stake_total"] > 0 else 0.0,
+                axis=1,
+            )
             grp = grp.sort_values("roi_pct", ascending=False)
             st.markdown("#### ROI por régimen VIX (solo días con VIX)")
             st.dataframe(grp, use_container_width=True)
@@ -895,30 +884,24 @@ def show_banca():
             e["fecha"] = pd.to_datetime(e["fecha"], errors="coerce").dt.date
 
         cols_v = ["fecha"]
-        for c in ["estado", "accion", "comentario", "raw_accion", "raw_comentario"]:
+        for c in ["estado", "accion", "comentario"]:
             if c in v.columns:
                 cols_v.append(c)
 
         merged = e.merge(v[cols_v], on="fecha", how="left")
-        st.dataframe(merged.sort_values("fecha", ascending=False), use_container_width=True)
+        st.dataframe(
+            merged.sort_values("fecha", ascending=False),
+            use_container_width=True
+        )
     else:
         st.info("No hay VIX suficiente para cruzar con la banca.")
 
 
 # ======================================================================
-# VISTA: VIX (robusta: solo vix_daily) + ÓRDENES
+# VISTA: VIX (robusta: vix_daily + órdenes + export)
 # ======================================================================
 def show_vix():
     st.markdown("### VIX – régimen diario (SVIX / NEUTRAL / UVIX)")
-
-    st.markdown(
-        """
-**Cómo leerlo:**
-- **`raw_accion`** = señal del día “en bruto” (sin filtros anti-ruido).
-- **`accion`** = señal final “operable” (con confirmación/cooldown si están en tu vix.py).
-- **`comentario`** explica el porqué en lenguaje humano.
-        """.strip()
-    )
 
     c1, c2 = st.columns([1, 2])
     with c1:
@@ -930,8 +913,6 @@ def show_vix():
         try:
             run_vix_pipeline(start=str(start), end=str(end))
             st.success("VIX actualizado y guardado en Supabase (vix_daily).")
-            # refrescamos cache
-            _fetch_vix_daily_cached.clear()
             st.rerun()
         except Exception as e:
             st.exception(e)
@@ -965,22 +946,18 @@ def show_vix():
     cC.metric("Acción", str(last.get("accion", "—")))
     st.write(f"**Comentario:** {last.get('comentario', '')}")
 
-    if "raw_accion" in daily.columns or "raw_comentario" in daily.columns:
-        st.markdown("#### Detalle (señal en bruto vs señal final)")
-        st.write(f"**raw_accion:** {last.get('raw_accion', '—')}")
-        st.write(f"**raw_comentario:** {last.get('raw_comentario', '')}")
-
     st.markdown("---")
 
-    for col in ["vix", "vxn_vix_ratio", "vixy_ma_3", "vixy_ma_10", "spy", "spy_ret"]:
+    for col in ["vix", "vxn_vix_ratio", "vixy_ma_3", "vixy_ma_10", "spy_ret", "vixy"]:
         _safe_numeric(daily, col)
 
     st.markdown("#### Explicación rápida de los indicadores")
     st.markdown(
         """
 - **VXN/VIX**: compara “miedo Nasdaq” vs “miedo S&P”. Si sube y se dispara, suele indicar stress más “tech”.
-- **Contango proxy (MA corta vs MA larga del proxy de volatilidad)**: si la media corta supera a la larga,
-  suele ser señal de tensión (menos carry / más backwardation-like).
+- **Contango proxy (MA3 vs MA10 de VXX guardado en `vixy`)**: si **MA3 > MA10** suele ser síntoma de tensión
+  (menos carry / estructura más tensa).
+- **SPY_ret**: retorno diario del S&P (proxy SPY). Un -0.8% o peor añade “stress” al score UVIX.
         """.strip()
     )
 
@@ -992,46 +969,66 @@ def show_vix():
         st.markdown("#### Ratio VXN/VIX")
         st.line_chart(daily.set_index("fecha")[["vxn_vix_ratio"]], use_container_width=True)
 
-    cont_cols = []
-    if "vixy_ma_3" in daily.columns and "vixy_ma_10" in daily.columns:
-        cont_cols = ["vixy_ma_3", "vixy_ma_10"]
-
-    if cont_cols:
+    cont_cols = [c for c in ["vixy_ma_3", "vixy_ma_10"] if c in daily.columns]
+    if len(cont_cols) == 2:
         st.markdown("#### Contango proxy (MA corta vs MA larga)")
         st.line_chart(daily.set_index("fecha")[cont_cols], use_container_width=True)
     else:
-        st.info("No hay columnas MA3/MA10 del proxy de volatilidad en vix_daily (no rompe nada).")
+        st.info("No hay columnas de medias móviles MA3/MA10 en vix_daily.")
 
     st.markdown("#### Tabla (vix_daily)")
     show_cols = [c for c in [
         "fecha",
         "estado", "accion", "comentario",
-        "raw_accion", "raw_comentario",
         "vix", "vxn", "vixy", "spy",
         "vxn_vix_ratio", "contango_ok", "macro_tomorrow",
         "vix_p25", "vix_p65", "vix_p85",
         "vixy_ma_3", "vixy_ma_10",
         "spy_ret",
-        # si existen OHLC de SVIX/UVIX, los mostramos (sin obligar)
         "svix_open", "svix_high", "svix_low", "svix_close",
         "uvix_open", "uvix_high", "uvix_low", "uvix_close",
     ] if c in daily.columns]
     st.dataframe(daily[show_cols].sort_values("fecha", ascending=False), use_container_width=True)
 
-    # ==================================================================
-    # ÓRDENES VIX (entrada/salida)
-    # ==================================================================
+    # --------------------------
+    # EXPORT (Excel-friendly)
+    # --------------------------
+    st.markdown("---")
+    st.markdown("### Exportar vix_daily")
+
+    export_df = daily[show_cols].sort_values("fecha", ascending=True).copy()
+    if "fecha" in export_df.columns:
+        export_df["fecha"] = pd.to_datetime(export_df["fecha"], errors="coerce").dt.date
+
+    # CSV “Excel España” => ; como separador
+    csv_bytes = export_df.to_csv(index=False, sep=";", encoding="utf-8").encode("utf-8")
+    st.download_button(
+        "⬇️ Descargar CSV (formato Excel-friendly ;)",
+        data=csv_bytes,
+        file_name="vix_daily_export.csv",
+        mime="text/csv",
+    )
+
+    # Excel xlsx
+    try:
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            export_df.to_excel(writer, index=False, sheet_name="vix_daily")
+        st.download_button(
+            "⬇️ Descargar Excel (.xlsx)",
+            data=buffer.getvalue(),
+            file_name="vix_daily_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as e:
+        st.warning(f"No se pudo generar Excel (.xlsx): {e}")
+
+    # --------------------------
+    # Órdenes VIX
+    # --------------------------
     st.markdown("---")
     st.markdown("### Órdenes VIX (entrada/salida)")
 
-    if not _VIX_ORDERS_AVAILABLE:
-        st.warning(
-            "El módulo de órdenes no está disponible porque faltan funciones en backend/vix.py "
-            "(fetch_vix_orders / insert_vix_order / update_vix_order_status)."
-        )
-        return
-
-    # Sugerencia: usar última señal como ayuda
     estado_hoy = str(last.get("estado", "NEUTRAL"))
     accion_hoy = str(last.get("accion", ""))
     comentario_hoy = str(last.get("comentario", ""))
@@ -1056,10 +1053,7 @@ def show_vix():
         with c6:
             price = st.number_input("Precio (opcional)", min_value=0.0, value=0.0, step=0.01)
         with c7:
-            notes = st.text_input(
-                "Notas (opcional)",
-                value=f"Auto: estado={estado_hoy} | accion={accion_hoy} | {comentario_hoy[:80]}",
-            )
+            notes = st.text_input("Notas (opcional)", value=f"Auto: estado={estado_hoy} | accion={accion_hoy}")
 
         if st.button("Guardar orden"):
             try:
@@ -1095,7 +1089,7 @@ def show_vix():
         st.markdown("#### Actualizar estado de una orden")
         c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
         with c1:
-            default_id = int(orders.iloc[0]["id"]) if "id" in orders.columns and len(orders) else 1
+            default_id = int(orders.iloc[0]["id"]) if ("id" in orders.columns and len(orders) > 0) else 1
             order_id = st.number_input("Order ID", min_value=1, value=default_id, step=1)
         with c2:
             new_status = st.selectbox("Nuevo status", options=["PLANNED","EXECUTED","CANCELLED"], index=1)
