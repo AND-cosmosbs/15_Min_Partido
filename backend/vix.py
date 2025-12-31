@@ -62,14 +62,15 @@ def _pick_close_column(df: pd.DataFrame) -> pd.Series:
     cols = list(df.columns)
 
     if isinstance(df.columns, pd.MultiIndex):
-        # intentamos el nivel Close
-        try:
-            s = df["Close"]
-            if isinstance(s, pd.DataFrame):
-                s = s.iloc[:, 0]
-            return s
-        except Exception:
-            pass
+        # yfinance a veces devuelve MultiIndex
+        if ("Close" in df.columns.get_level_values(0)) or ("close" in df.columns.get_level_values(0)):
+            try:
+                s = df["Close"]
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                return s
+            except Exception:
+                pass
 
     for c in ["Close", "close", "Adj Close", "adjclose", "AdjClose"]:
         if c in cols:
@@ -81,29 +82,6 @@ def _pick_close_column(df: pd.DataFrame) -> pd.Series:
     raise RuntimeError(f"No se encontró columna de cierre en Yahoo. Columnas: {cols}")
 
 
-def _pick_ohlc_series(df: pd.DataFrame, colname: str) -> pd.Series:
-    """
-    yfinance a veces devuelve columnas MultiIndex o DataFrame.
-    Esto fuerza a devolver una Series 1D.
-    """
-    if colname not in df.columns:
-        # MultiIndex: puede existir con primer nivel colname
-        if isinstance(df.columns, pd.MultiIndex):
-            try:
-                s = df[colname]
-                if isinstance(s, pd.DataFrame):
-                    s = s.iloc[:, 0]
-                return pd.Series(s.values, index=df.index)
-            except Exception:
-                pass
-        raise RuntimeError(f"No se encontró columna {colname}. Columnas: {list(df.columns)}")
-
-    s = df[colname]
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
-    return pd.Series(s.values, index=df.index)
-
-
 def _ensure_expected_columns(out: pd.DataFrame, expected: Iterable[str]) -> None:
     missing = [c for c in expected if c not in out.columns]
     if missing:
@@ -111,6 +89,18 @@ def _ensure_expected_columns(out: pd.DataFrame, expected: Iterable[str]) -> None
             "Descarga/merge incompleto. Faltan columnas: "
             f"{missing}. Columnas presentes: {list(out.columns)}"
         )
+
+
+def _series1d(x: Any) -> pd.Series:
+    """
+    Convierte a Series 1D (por si yfinance devuelve DataFrame).
+    """
+    if isinstance(x, pd.Series):
+        return x
+    if isinstance(x, pd.DataFrame):
+        return x.iloc[:, 0]
+    # último recurso
+    return pd.Series(x)
 
 
 def _json_sanitize_value(x: Any) -> Any:
@@ -185,18 +175,15 @@ def macro_tomorrow_flag(fecha: pd.Timestamp, macro_df: pd.DataFrame) -> bool:
 
 def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
     """
-    Descarga diaria de: ^VIX, ^VXN, VXX (proxy contango/backwardation), SPY
+    Descarga diaria de: ^VIX, ^VXN, proxy contango VXX (guardado en columna vixy), SPY
     Devuelve columnas: date, vix, vxn, vixy, spy
-
-    NOTA IMPORTANTE:
-    - Aunque descargamos VXX, lo guardamos en columna "vixy" para no romper tu esquema histórico.
     """
     import yfinance as yf
 
     tickers = {
         "^VIX": "vix",
         "^VXN": "vxn",
-        "VXX": "vixy",  # guardamos VXX como vixy por compatibilidad con tu DB
+        "VXX": "vixy",   # OJO: guardamos VXX en columna vixy (para no tocar schema)
         "SPY": "spy",
     }
 
@@ -220,7 +207,7 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
         data = _normalize_date_index(data)
         close = _pick_close_column(data)
 
-        df_one = pd.DataFrame({"date": data["date"], col: pd.to_numeric(close, errors="coerce").values})
+        df_one = pd.DataFrame({"date": data["date"], col: _series1d(close).values})
         df_one["date"] = pd.to_datetime(df_one["date"], errors="coerce").dt.normalize()
 
         if out is None:
@@ -230,6 +217,7 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
 
     assert out is not None
     out = out.sort_values("date").reset_index(drop=True)
+
     _ensure_expected_columns(out, ["date", "vix", "vxn", "vixy", "spy"])
     return out
 
@@ -265,19 +253,23 @@ def download_trade_ohlc(start: str, end: str) -> pd.DataFrame:
 
         data = _normalize_date_index(data)
 
-        o = _pick_ohlc_series(data, "Open")
-        h = _pick_ohlc_series(data, "High")
-        l = _pick_ohlc_series(data, "Low")
-        c = _pick_ohlc_series(data, "Close")
+        # yfinance típico trae Open/High/Low/Close (pero a veces como DF)
+        for needed in ["Open", "High", "Low", "Close"]:
+            if needed not in data.columns:
+                raise RuntimeError(f"{tkr} no trae columna {needed}. Columnas: {list(data.columns)}")
+
+        o = _series1d(data["Open"])
+        h = _series1d(data["High"])
+        l = _series1d(data["Low"])
+        c = _series1d(data["Close"])
 
         df_one = pd.DataFrame({
-            "date": data["date"].values,
+            "date": pd.to_datetime(data["date"], errors="coerce").dt.normalize(),
             f"{prefix}_open": pd.to_numeric(o, errors="coerce").values,
             f"{prefix}_high": pd.to_numeric(h, errors="coerce").values,
             f"{prefix}_low": pd.to_numeric(l, errors="coerce").values,
             f"{prefix}_close": pd.to_numeric(c, errors="coerce").values,
         })
-        df_one["date"] = pd.to_datetime(df_one["date"], errors="coerce").dt.normalize()
 
         if out is None:
             out = df_one
@@ -299,10 +291,10 @@ def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataF
 
     w["vix"] = _safe_num_series(w["vix"])
     w["vxn"] = _safe_num_series(w["vxn"])
-    w["vixy"] = _safe_num_series(w["vixy"])  # aquí realmente es VXX, pero guardado como vixy
+    w["vixy"] = _safe_num_series(w["vixy"])
     w["spy"] = _safe_num_series(w["spy"])
 
-    # retorno SPY (proxy S&P500)
+    # retorno SPY
     w["spy_ret"] = w["spy"].pct_change()
 
     # ratio VXN/VIX + dirección
@@ -316,10 +308,11 @@ def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataF
     w["vix_p65"] = w["vix"].rolling(lb).quantile(0.65)
     w["vix_p85"] = w["vix"].rolling(lb).quantile(0.85)
 
-    # MA sobre proxy vol (columna vixy, pero viene de VXX)
+    # MA sobre vixy (que ahora contiene VXX como proxy)
     w["vixy_ma_3"] = w["vixy"].rolling(3).mean()
     w["vixy_ma_10"] = w["vixy"].rolling(10).mean()
 
+    # contango_ok: MA corta < MA larga
     w["contango_ok"] = w["vixy_ma_3"] < w["vixy_ma_10"]
     return w
 
@@ -346,6 +339,7 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
             "comentario": "Guardarraíl: VIX extremadamente bajo (riesgo snapback).",
         }
 
+    # SVIX
     cond_svix = (
         (vix < p25)
         and (pd.notna(ratio) and ratio < cfg.ratio_ok)
@@ -355,18 +349,17 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
     if cond_svix:
         return {"estado": "SVIX", "accion": "OPEN/HOLD SVIX", "comentario": "Calma + contango + sin macro mañana."}
 
+    # UVIX (stress score >=2)
     uvix_cond1 = vix > p65
     uvix_cond2 = (pd.notna(ratio) and ratio > cfg.ratio_alert and ratio_up)
-    uvix_cond3 = (
-        pd.notna(row.get("vixy_ma_3")) and pd.notna(row.get("vixy_ma_10"))
-        and (row.get("vixy_ma_3") > row.get("vixy_ma_10"))
-    )
+    uvix_cond3 = (pd.notna(row.get("vixy_ma_3")) and pd.notna(row.get("vixy_ma_10")) and (row.get("vixy_ma_3") > row.get("vixy_ma_10")))
     uvix_cond4 = (pd.notna(spy_ret) and spy_ret < -0.008)
 
     uvix_score = sum([bool(uvix_cond1), bool(uvix_cond2), bool(uvix_cond3), bool(uvix_cond4)])
     if uvix_score >= 2:
         return {"estado": "UVIX", "accion": "OPEN/HOLD UVIX", "comentario": f"Stress score={uvix_score}."}
 
+    # PREP_SVIX
     cond_prep = (vix > p85) and (ratio_up is False) and contango_ok
     if cond_prep:
         return {"estado": "PREP_SVIX", "accion": "WAIT / PREPARE SVIX", "comentario": "Pánico se agota + contango vuelve."}
@@ -416,12 +409,10 @@ def upsert_vix_daily(df: pd.DataFrame) -> int:
         "contango_ok",
         "macro_tomorrow",
         "estado", "accion", "comentario",
-        # OHLC operables (si existen en el DF y en tu tabla)
+        # OHLC operables
         "svix_open", "svix_high", "svix_low", "svix_close",
         "uvix_open", "uvix_high", "uvix_low", "uvix_close",
     ]
-
-    # IMPORTANTÍSIMO: solo mandamos columnas que existen en el DataFrame
     w = w[[c for c in keep_cols if c in w.columns]].copy()
 
     records: List[Dict[str, Any]] = w.to_dict(orient="records")
@@ -446,23 +437,13 @@ def fetch_vix_daily() -> pd.DataFrame:
 
 
 # -----------------------------
-# ÓRDENES VIX (vix_orders)
+# Órdenes VIX (Supabase)
 # -----------------------------
 
-def fetch_vix_orders(limit: int = 200) -> pd.DataFrame:
-    """
-    Lee vix_orders. Esperado: id, fecha, estado_signal, ticker, side, qty, price, status, notes, created_at, updated_at
-    """
-    resp = (
-        supabase.table("vix_orders")
-        .select("*")
-        .order("fecha", desc=True)
-        .limit(int(limit))
-        .execute()
-    )
+def fetch_vix_orders(limit: int = 300) -> pd.DataFrame:
+    resp = supabase.table("vix_orders").select("*").order("fecha", desc=True).limit(limit).execute()
     if getattr(resp, "error", None):
         raise RuntimeError(resp.error)
-
     data = getattr(resp, "data", None) or []
     df = pd.DataFrame(data)
     if not df.empty and "fecha" in df.columns:
@@ -481,14 +462,14 @@ def insert_vix_order(
     estado_signal: Optional[str] = None,
 ) -> int:
     payload: Dict[str, Any] = {
-        "fecha": pd.to_datetime(fecha, errors="coerce").date().isoformat(),
-        "ticker": (ticker or "").upper().strip(),
-        "side": (side or "").upper().strip(),
+        "fecha": pd.to_datetime(fecha, errors="coerce").date().isoformat() if fecha is not None else None,
+        "ticker": ticker,
+        "side": side,
         "qty": float(qty),
-        "status": (status or "PLANNED").upper().strip(),
-        "estado_signal": estado_signal,
+        "price": float(price) if price is not None else None,
+        "status": status,
         "notes": notes,
-        "price": price,
+        "estado_signal": estado_signal,
     }
     payload = {k: _json_sanitize_value(v) for k, v in payload.items()}
 
@@ -499,7 +480,7 @@ def insert_vix_order(
     data = getattr(resp, "data", None) or []
     if data and isinstance(data, list) and "id" in data[0]:
         return int(data[0]["id"])
-    return 0
+    return 1
 
 
 def update_vix_order_status(
@@ -509,7 +490,7 @@ def update_vix_order_status(
     notes: Optional[str] = None,
 ) -> None:
     patch: Dict[str, Any] = {
-        "status": (status or "").upper().strip(),
+        "status": status,
     }
     if price is not None:
         patch["price"] = float(price)
