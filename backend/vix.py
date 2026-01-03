@@ -139,6 +139,46 @@ def _json_sanitize_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return clean
 
 
+def _supabase_select_all(
+    table: str,
+    order_col: str,
+    asc: bool = True,
+    batch_size: int = 1000,
+) -> List[Dict[str, Any]]:
+    """
+    PostgREST/Supabase devuelve 1000 filas por defecto si no paginamos.
+    Esto descarga TODAS las filas por bloques.
+    """
+    out: List[Dict[str, Any]] = []
+    start = 0
+
+    while True:
+        end = start + batch_size - 1
+        resp = (
+            supabase.table(table)
+            .select("*")
+            .order(order_col, desc=(not asc))
+            .range(start, end)
+            .execute()
+        )
+        if getattr(resp, "error", None):
+            raise RuntimeError(resp.error)
+
+        data = getattr(resp, "data", None) or []
+        if not data:
+            break
+
+        out.extend(data)
+
+        # Si devolvió menos de batch_size, ya no hay más.
+        if len(data) < batch_size:
+            break
+
+        start += batch_size
+
+    return out
+
+
 # -----------------------------
 # Supabase: macro events
 # -----------------------------
@@ -253,7 +293,6 @@ def download_trade_ohlc(start: str, end: str) -> pd.DataFrame:
 
         data = _normalize_date_index(data)
 
-        # yfinance típico trae Open/High/Low/Close (pero a veces como DF)
         for needed in ["Open", "High", "Low", "Close"]:
             if needed not in data.columns:
                 raise RuntimeError(f"{tkr} no trae columna {needed}. Columnas: {list(data.columns)}")
@@ -312,7 +351,6 @@ def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataF
     w["vixy_ma_3"] = w["vixy"].rolling(3).mean()
     w["vixy_ma_10"] = w["vixy"].rolling(10).mean()
 
-    # contango_ok: MA corta < MA larga
     w["contango_ok"] = w["vixy_ma_3"] < w["vixy_ma_10"]
     return w
 
@@ -339,7 +377,6 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
             "comentario": "Guardarraíl: VIX extremadamente bajo (riesgo snapback).",
         }
 
-    # SVIX
     cond_svix = (
         (vix < p25)
         and (pd.notna(ratio) and ratio < cfg.ratio_ok)
@@ -349,17 +386,19 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
     if cond_svix:
         return {"estado": "SVIX", "accion": "OPEN/HOLD SVIX", "comentario": "Calma + contango + sin macro mañana."}
 
-    # UVIX (stress score >=2)
     uvix_cond1 = vix > p65
     uvix_cond2 = (pd.notna(ratio) and ratio > cfg.ratio_alert and ratio_up)
-    uvix_cond3 = (pd.notna(row.get("vixy_ma_3")) and pd.notna(row.get("vixy_ma_10")) and (row.get("vixy_ma_3") > row.get("vixy_ma_10")))
+    uvix_cond3 = (
+        pd.notna(row.get("vixy_ma_3"))
+        and pd.notna(row.get("vixy_ma_10"))
+        and (row.get("vixy_ma_3") > row.get("vixy_ma_10"))
+    )
     uvix_cond4 = (pd.notna(spy_ret) and spy_ret < -0.008)
 
     uvix_score = sum([bool(uvix_cond1), bool(uvix_cond2), bool(uvix_cond3), bool(uvix_cond4)])
     if uvix_score >= 2:
         return {"estado": "UVIX", "accion": "OPEN/HOLD UVIX", "comentario": f"Stress score={uvix_score}."}
 
-    # PREP_SVIX
     cond_prep = (vix > p85) and (ratio_up is False) and contango_ok
     if cond_prep:
         return {"estado": "PREP_SVIX", "accion": "WAIT / PREPARE SVIX", "comentario": "Pánico se agota + contango vuelve."}
@@ -389,119 +428,6 @@ def compute_states(df_feat: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.Da
 
 
 # -----------------------------
-# Filtros anti-ruido (confirmación + cooldown + anti-flip)
-# -----------------------------
-
-def apply_signal_filters(
-    df: pd.DataFrame,
-    confirm_days_uvix: int = 2,
-    confirm_days_svix: int = 2,
-    cooldown_days: int = 3,
-) -> pd.DataFrame:
-    """
-    Convierte señal bruta -> señal final operable.
-    - Confirmación: exige N días seguidos antes de abrir.
-    - Cooldown: tras un cierre/cambio, bloquea nuevos opens durante X días.
-    - Anti-flip: evita alternancia UVIX <-> SVIX día a día (por cooldown + confirmación).
-    Crea:
-      - raw_accion / raw_comentario (bruto)
-      - accion / comentario (final)
-    """
-    w = df.copy().sort_values("date").reset_index(drop=True)
-
-    # guardamos señal original
-    w["raw_accion"] = w.get("accion")
-    w["raw_comentario"] = w.get("comentario")
-
-    def _is_open_uvix(a: Any) -> bool:
-        s = str(a or "")
-        return ("UVIX" in s) and ("OPEN" in s)
-
-    def _is_open_svix(a: Any) -> bool:
-        s = str(a or "")
-        return ("SVIX" in s) and ("OPEN" in s)
-
-    uvix_streak = 0
-    svix_streak = 0
-
-    pos: Optional[str] = None  # None / "UVIX" / "SVIX"
-    cooldown_left = 0
-
-    final_actions: List[str] = []
-    final_comments: List[str] = []
-
-    for _, row in w.iterrows():
-        raw_a = row.get("raw_accion")
-        raw_c = str(row.get("raw_comentario") or "")
-
-        # streaks
-        if _is_open_uvix(raw_a):
-            uvix_streak += 1
-        else:
-            uvix_streak = 0
-
-        if _is_open_svix(raw_a):
-            svix_streak += 1
-        else:
-            svix_streak = 0
-
-        # cooldown tick
-        if cooldown_left > 0:
-            cooldown_left -= 1
-
-        # default
-        action = "HOLD" if pos else "NO TRADE"
-        comment = raw_c
-
-        # 1) gestión si ya hay posición
-        if pos == "UVIX":
-            if not _is_open_uvix(raw_a):
-                action = "CLOSE UVIX"
-                comment = f"{raw_c} | filtro: salida (condición UVIX desaparece)"
-                pos = None
-                cooldown_left = cooldown_days
-            else:
-                action = "HOLD UVIX"
-
-        elif pos == "SVIX":
-            if not _is_open_svix(raw_a):
-                action = "CLOSE SVIX"
-                comment = f"{raw_c} | filtro: salida (condición SVIX desaparece)"
-                pos = None
-                cooldown_left = cooldown_days
-            else:
-                action = "HOLD SVIX"
-
-        # 2) si no hay posición, evaluar apertura (respetando cooldown + confirmación)
-        if pos is None:
-            if cooldown_left > 0:
-                action = "NO TRADE"
-                comment = f"{raw_c} | filtro: cooldown activo ({cooldown_left}d)"
-            else:
-                can_open_uvix = _is_open_uvix(raw_a) and (uvix_streak >= confirm_days_uvix)
-                can_open_svix = _is_open_svix(raw_a) and (svix_streak >= confirm_days_svix)
-
-                # preferencia por seguridad: si coincidieran (raro), UVIX primero
-                if can_open_uvix:
-                    action = "OPEN UVIX"
-                    comment = f"{raw_c} | filtro: confirm UVIX {uvix_streak}/{confirm_days_uvix}"
-                    pos = "UVIX"
-                elif can_open_svix:
-                    action = "OPEN SVIX"
-                    comment = f"{raw_c} | filtro: confirm SVIX {svix_streak}/{confirm_days_svix}"
-                    pos = "SVIX"
-                else:
-                    action = "NO TRADE"
-
-        final_actions.append(action)
-        final_comments.append(comment)
-
-    w["accion"] = final_actions
-    w["comentario"] = final_comments
-    return w
-
-
-# -----------------------------
 # Supabase: vix_daily (única tabla)
 # -----------------------------
 
@@ -522,9 +448,6 @@ def upsert_vix_daily(df: pd.DataFrame) -> int:
         "contango_ok",
         "macro_tomorrow",
         "estado", "accion", "comentario",
-        # raw signal (si existe en schema)
-        "raw_accion", "raw_comentario",
-        # OHLC operables
         "svix_open", "svix_high", "svix_low", "svix_close",
         "uvix_open", "uvix_high", "uvix_low", "uvix_close",
     ]
@@ -541,10 +464,8 @@ def upsert_vix_daily(df: pd.DataFrame) -> int:
 
 
 def fetch_vix_daily() -> pd.DataFrame:
-    resp = supabase.table("vix_daily").select("*").order("fecha", desc=False).execute()
-    if getattr(resp, "error", None):
-        raise RuntimeError(resp.error)
-    data = getattr(resp, "data", None) or []
+    # ✅ IMPORTANTE: paginamos para no quedarnos en 1000 filas
+    data = _supabase_select_all(table="vix_daily", order_col="fecha", asc=True, batch_size=1000)
     df = pd.DataFrame(data)
     if not df.empty and "fecha" in df.columns:
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
@@ -556,10 +477,19 @@ def fetch_vix_daily() -> pd.DataFrame:
 # -----------------------------
 
 def fetch_vix_orders(limit: int = 300) -> pd.DataFrame:
-    resp = supabase.table("vix_orders").select("*").order("fecha", desc=True).limit(limit).execute()
-    if getattr(resp, "error", None):
-        raise RuntimeError(resp.error)
-    data = getattr(resp, "data", None) or []
+    # Si pides pocas (limit), usamos el endpoint normal.
+    if limit <= 1000:
+        resp = supabase.table("vix_orders").select("*").order("fecha", desc=True).limit(limit).execute()
+        if getattr(resp, "error", None):
+            raise RuntimeError(resp.error)
+        data = getattr(resp, "data", None) or []
+        df = pd.DataFrame(data)
+        if not df.empty and "fecha" in df.columns:
+            df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+        return df
+
+    # Si algún día quieres más de 1000, también paginamos:
+    data = _supabase_select_all(table="vix_orders", order_col="fecha", asc=False, batch_size=1000)
     df = pd.DataFrame(data)
     if not df.empty and "fecha" in df.columns:
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
@@ -604,9 +534,7 @@ def update_vix_order_status(
     price: Optional[float] = None,
     notes: Optional[str] = None,
 ) -> None:
-    patch: Dict[str, Any] = {
-        "status": status,
-    }
+    patch: Dict[str, Any] = {"status": status}
     if price is not None:
         patch["price"] = float(price)
     if notes is not None:
@@ -626,12 +554,7 @@ def update_vix_order_status(
 def run_vix_pipeline(start: str, end: str, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
     raw = download_yahoo_daily(start=start, end=end)
     feat = compute_features(raw, cfg=cfg)
-
-    # señal bruta
     out = compute_states(feat, cfg=cfg)
-
-    # filtros anti-ruido (esto crea raw_accion/raw_comentario y deja accion/comentario final)
-    out = apply_signal_filters(out, confirm_days_uvix=2, confirm_days_svix=2, cooldown_days=3)
 
     # merge OHLC operables (SVIX/UVIX)
     ohlc = download_trade_ohlc(start=start, end=end)
