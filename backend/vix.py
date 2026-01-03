@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Iterable, Tuple
+import re
 
 import numpy as np
 import pandas as pd
@@ -25,13 +26,25 @@ class VixConfig:
     use_guardrail: bool = True
     guardrail_vix_floor: float = 12.5  # si VIX < 12.5 => no abrir SVIX
 
-    # -----------------------------
-    # Anti-ruido / ejecución operable (A+B+C)
-    # -----------------------------
-    confirm_days: int = 2              # A) confirmación
-    cooldown_days: int = 3             # B) cooldown tras un cambio ejecutado
-    anti_flip_strong: bool = True      # C) anti-flip fuerte
-    min_neutral_between_flips: int = 1 # C) requiere >= 1 día NEUTRAL antes de entrar en la contraria
+    # =========================
+    # A) Confirmación anti-ruido
+    # =========================
+    confirm_days: int = 2  # requiere N días seguidos del mismo "raw_estado" para cambiar
+
+    # =========================
+    # B) Cooldown anti-latigazos
+    # =========================
+    cooldown_days: int = 3  # tras un cambio "real" de régimen, no volver a cambiar durante N días
+
+    # =========================
+    # C) Anti-flip SVIX<->UVIX
+    # =========================
+    anti_flip: bool = True  # si True, impide pasar directo SVIX<->UVIX; obliga a pasar por NEUTRAL
+
+    # UVIX solo pánico real
+    uvix_spy_panic_thresh: float = -0.012  # -1.2% (spy_ret <= -0.012)
+    uvix_min_score: int = 3  # requiere score >= 3
+    uvix_require_vix_extreme: bool = True  # requiere vix > p85
 
 
 DEFAULT_CFG = VixConfig()
@@ -185,6 +198,56 @@ def _supabase_select_all(
         start += batch_size
 
     return out
+
+
+def _extract_missing_column_from_postgrest_error(msg: str) -> Optional[str]:
+    """
+    Ej:
+    "Could not find the 'vxx' column of 'vix_daily' in the schema cache"
+    """
+    if not msg:
+        return None
+    m = re.search(r"Could not find the '([^']+)' column", msg)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _upsert_with_schema_fallback(table: str, records: List[Dict[str, Any]], on_conflict: str) -> None:
+    """
+    Si Supabase/PostgREST se queja de una columna que no existe en el schema cache,
+    reintentamos quitando esa columna de todos los records.
+    """
+    if not records:
+        return
+
+    # Reintento en bucle por si hay varias columnas conflictivas
+    max_tries = 8
+    current = records
+
+    for _ in range(max_tries):
+        resp = supabase.table(table).upsert(current, on_conflict=on_conflict).execute()
+        err = getattr(resp, "error", None)
+        if not err:
+            return
+
+        err_str = str(err)
+        missing = _extract_missing_column_from_postgrest_error(err_str)
+        if not missing:
+            raise RuntimeError(err)
+
+        # quitamos esa col y reintentamos
+        new_records: List[Dict[str, Any]] = []
+        for r in current:
+            if missing in r:
+                r = dict(r)
+                r.pop(missing, None)
+            new_records.append(r)
+
+        current = new_records
+
+    # si agota reintentos
+    raise RuntimeError("Upsert falló tras reintentos por columnas inexistentes en schema cache.")
 
 
 # -----------------------------
@@ -385,6 +448,7 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
             "comentario": "Guardarraíl: VIX extremadamente bajo (riesgo snapback).",
         }
 
+    # SVIX (calma + contango + sin macro mañana)
     cond_svix = (
         (vix < p25)
         and (pd.notna(ratio) and ratio < cfg.ratio_ok)
@@ -394,6 +458,7 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
     if cond_svix:
         return {"estado": "SVIX", "accion": "OPEN/HOLD SVIX", "comentario": "Calma + contango + sin macro mañana."}
 
+    # UVIX: condiciones base (score)
     uvix_cond1 = vix > p65
     uvix_cond2 = (pd.notna(ratio) and ratio > cfg.ratio_alert and ratio_up)
     uvix_cond3 = (
@@ -401,12 +466,24 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
         and pd.notna(row.get("vixy_ma_10"))
         and (row.get("vixy_ma_3") > row.get("vixy_ma_10"))
     )
-    uvix_cond4 = (pd.notna(spy_ret) and spy_ret < -0.008)
+    uvix_cond4 = (pd.notna(spy_ret) and float(spy_ret) < -0.008)
 
     uvix_score = sum([bool(uvix_cond1), bool(uvix_cond2), bool(uvix_cond3), bool(uvix_cond4)])
-    if uvix_score >= 2:
-        return {"estado": "UVIX", "accion": "OPEN/HOLD UVIX", "comentario": f"Stress score={uvix_score}."}
 
+    # ✅ UVIX "solo pánico real"
+    spy_panic = (pd.notna(spy_ret) and float(spy_ret) <= float(cfg.uvix_spy_panic_thresh))
+    vix_extremo = True
+    if cfg.uvix_require_vix_extreme:
+        vix_extremo = (pd.notna(vix) and pd.notna(p85) and float(vix) > float(p85))
+
+    if (uvix_score >= int(cfg.uvix_min_score)) and vix_extremo and spy_panic:
+        return {
+            "estado": "UVIX",
+            "accion": "OPEN/HOLD UVIX",
+            "comentario": f"PANIC UVIX: score={uvix_score}, vix>p85 y spy_ret<={cfg.uvix_spy_panic_thresh*100:.1f}%.",
+        }
+
+    # PREP_SVIX
     cond_prep = (vix > p85) and (ratio_up is False) and contango_ok
     if cond_prep:
         return {"estado": "PREP_SVIX", "accion": "WAIT / PREPARE SVIX", "comentario": "Pánico se agota + contango vuelve."}
@@ -414,213 +491,12 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
     return {"estado": "NEUTRAL", "accion": "NO NEW POSITION", "comentario": "Régimen mixto / transición."}
 
 
-# -----------------------------
-# Filtros A+B+C (operable)
-# -----------------------------
-
-def _operable_target_from_raw_estado(raw_estado: str) -> str:
-    """
-    Reduce estados RAW a un target operable:
-      - SVIX / UVIX => posiciones
-      - todo lo demás => NEUTRAL
-    """
-    if raw_estado in ("SVIX", "UVIX"):
-        return raw_estado
-    return "NEUTRAL"
-
-
-def _accion_for_target(target: str, prev_target: str, raw_accion: str) -> str:
-    """
-    Define una acción final coherente y estable.
-    """
-    if target == "SVIX":
-        return "OPEN/HOLD SVIX"
-    if target == "UVIX":
-        return "OPEN/HOLD UVIX"
-
-    # target NEUTRAL
-    if prev_target in ("SVIX", "UVIX"):
-        return "CLOSE POSITION"
-    # si raw era NO DATA / NO OPEN SVIX, lo respetamos porque informa
-    if raw_accion in ("NO DATA", "NO OPEN SVIX"):
-        return raw_accion
-    return "NO NEW POSITION"
-
-
-def _apply_filters_abc(
-    df_with_raw: pd.DataFrame,
-    cfg: VixConfig,
-) -> pd.DataFrame:
-    """
-    Aplica:
-      A) confirmación (confirm_days)
-      B) cooldown (cooldown_days)
-      C) anti-flip fuerte (NEUTRAL obligatorio entre SVIX<->UVIX)
-    Mantiene raw_* y devuelve estado/accion/comentario finales.
-    """
-    w = df_with_raw.sort_values("date").reset_index(drop=True).copy()
-
-    # estado final (operable) que llevamos en el tiempo
-    current_target: str = "NEUTRAL"
-    prev_target: str = "NEUTRAL"
-
-    # cooldown: días restantes donde bloqueamos cualquier cambio
-    cooldown_left: int = 0
-
-    # confirmación: acumulación hacia un target "deseado"
-    pending_target: Optional[str] = None
-    pending_count: int = 0
-
-    # para C: contar días NEUTRAL consecutivos desde el último no-neutral
-    neutral_streak: int = 0
-    last_non_neutral: str = "NEUTRAL"
-
-    final_estado: List[str] = []
-    final_accion: List[str] = []
-    final_comentario: List[str] = []
-
-    for i, row in w.iterrows():
-        raw_estado = str(row.get("raw_estado", "NEUTRAL") or "NEUTRAL")
-        raw_accion = str(row.get("raw_accion", "") or "")
-        raw_com = str(row.get("raw_comentario", "") or "")
-
-        raw_target = _operable_target_from_raw_estado(raw_estado)
-
-        # Decrementamos cooldown por día
-        if cooldown_left > 0:
-            cooldown_left -= 1
-
-        # Track neutral streak (según target FINAL, pero aún no actualizado; usamos current_target ahora mismo)
-        if current_target == "NEUTRAL":
-            neutral_streak += 1
-        else:
-            neutral_streak = 0
-            last_non_neutral = current_target
-
-        # --- decidir target deseado, aplicando C (anti-flip fuerte) ---
-        desired_target = raw_target
-        forced_by_antiflip = False
-        confirm_needed = int(cfg.confirm_days)
-
-        if cfg.anti_flip_strong:
-            # Caso flip directo: estabas en SVIX/UVIX y raw pide la contraria
-            if current_target in ("SVIX", "UVIX") and raw_target in ("SVIX", "UVIX") and raw_target != current_target:
-                # Hoy forzamos NEUTRAL (salida inmediata) para evitar flip
-                desired_target = "NEUTRAL"
-                forced_by_antiflip = True
-                confirm_needed = 1  # salida inmediata por regla C
-
-            # Si estamos NEUTRAL y el raw pide entrar en el "opuesto" al último no-neutral,
-            # exigimos al menos min_neutral_between_flips días NEUTRAL completos
-            if current_target == "NEUTRAL" and raw_target in ("SVIX", "UVIX") and last_non_neutral in ("SVIX", "UVIX"):
-                if raw_target != last_non_neutral and neutral_streak < int(cfg.min_neutral_between_flips):
-                    desired_target = "NEUTRAL"
-                    forced_by_antiflip = True
-
-        # --- aplicar cooldown (B) ---
-        if cooldown_left > 0 and desired_target != current_target:
-            # En cooldown no se permiten cambios
-            accion = _accion_for_target(current_target, prev_target, raw_accion)
-            comentario = raw_com
-            comentario_extra = f"[Filtro] Cooldown activo ({cooldown_left}d restantes): se ignora cambio a {desired_target}."
-            if comentario:
-                comentario = f"{comentario} | {comentario_extra}"
-            else:
-                comentario = comentario_extra
-
-            final_estado.append(current_target if current_target != "NEUTRAL" else "NEUTRAL")
-            final_accion.append(accion)
-            final_comentario.append(comentario)
-
-            # reseteamos confirmación cuando estamos bloqueando por cooldown
-            pending_target = None
-            pending_count = 0
-
-            prev_target = current_target
-            continue
-
-        # --- aplicar confirmación (A) / ejecución del cambio ---
-        if desired_target != current_target:
-            # acumulamos confirmación hacia desired_target
-            if pending_target == desired_target:
-                pending_count += 1
-            else:
-                pending_target = desired_target
-                pending_count = 1
-
-            if pending_count >= confirm_needed:
-                # Ejecutamos cambio
-                prev_target = current_target
-                current_target = desired_target
-
-                # Reset confirmación y activar cooldown
-                pending_target = None
-                pending_count = 0
-                cooldown_left = int(cfg.cooldown_days)
-
-                accion = _accion_for_target(current_target, prev_target, raw_accion)
-
-                extra_bits = []
-                if forced_by_antiflip:
-                    extra_bits.append("[Filtro C] Anti-flip: NEUTRAL obligatorio entre SVIX y UVIX.")
-                if confirm_needed > 1:
-                    extra_bits.append(f"[Filtro A] Confirmación {confirm_needed} días: cambio ejecutado.")
-                else:
-                    extra_bits.append("[Filtro A] Confirmación 1 día: salida inmediata por anti-flip.")
-
-                comentario = raw_com
-                if extra_bits:
-                    extra = " ".join(extra_bits)
-                    comentario = f"{comentario} | {extra}" if comentario else extra
-
-                final_estado.append(current_target if current_target != "NEUTRAL" else "NEUTRAL")
-                final_accion.append(accion)
-                final_comentario.append(comentario)
-                continue
-
-            # Aún no confirmado: mantenemos target actual
-            accion = _accion_for_target(current_target, prev_target, raw_accion)
-
-            extra_bits = []
-            if forced_by_antiflip:
-                extra_bits.append("[Filtro C] Anti-flip: hoy NO se entra en la contraria; se fuerza/espera NEUTRAL.")
-            extra_bits.append(
-                f"[Filtro A] Confirmación: {pending_count}/{confirm_needed} hacia {desired_target} (mantengo {current_target})."
-            )
-
-            comentario = raw_com
-            extra = " ".join(extra_bits)
-            comentario = f"{comentario} | {extra}" if comentario else extra
-
-            final_estado.append(current_target if current_target != "NEUTRAL" else "NEUTRAL")
-            final_accion.append(accion)
-            final_comentario.append(comentario)
-            prev_target = current_target
-            continue
-
-        # desired == current => no hay cambio, reseteamos pending
-        pending_target = None
-        pending_count = 0
-
-        accion = _accion_for_target(current_target, prev_target, raw_accion)
-        comentario = raw_com
-        final_estado.append(current_target if current_target != "NEUTRAL" else "NEUTRAL")
-        final_accion.append(accion)
-        final_comentario.append(comentario)
-
-        prev_target = current_target
-
-    w["estado"] = final_estado
-    w["accion"] = final_accion
-    w["comentario"] = final_comentario
-    return w
-
-
 def compute_states(df_feat: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
     """
-    Devuelve dataframe con:
-      - raw_estado/raw_accion/raw_comentario (señal bruta)
-      - estado/accion/comentario (señal operable filtrada A+B+C)
+    Devuelve RAW:
+      - raw_estado / raw_accion / raw_comentario
+    y luego aplica filtros A+B+C para producir:
+      - estado / accion / comentario (operable)
     """
     w = df_feat.copy()
 
@@ -640,8 +516,125 @@ def compute_states(df_feat: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.Da
     w["raw_accion"] = raw_acciones
     w["raw_comentario"] = raw_comentarios
 
-    # Aplicamos filtros A+B+C para obtener estado/accion/comentario finales
-    w = _apply_filters_abc(w, cfg=cfg)
+    # Aplicamos A+B+C
+    w = apply_signal_filters(w, cfg=cfg)
+
+    return w
+
+
+# -----------------------------
+# A + B + C: filtros anti-ruido
+# -----------------------------
+
+def _desired_state_from_raw(raw_estado: str) -> str:
+    # Mantenemos como "régimen operable" SVIX / UVIX / NEUTRAL
+    if raw_estado in ("SVIX", "UVIX"):
+        return raw_estado
+    return "NEUTRAL"
+
+
+def apply_signal_filters(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
+    """
+    Implementa:
+      A) Confirmación (confirm_days)
+      B) Cooldown (cooldown_days)
+      C) Anti-flip SVIX<->UVIX (anti_flip)
+    Output:
+      - estado / accion / comentario (final)
+    """
+    w = df.copy()
+    if w.empty:
+        w["estado"] = pd.NA
+        w["accion"] = pd.NA
+        w["comentario"] = pd.NA
+        return w
+
+    # ordenar por fecha por seguridad
+    if "date" in w.columns:
+        w = w.sort_values("date").reset_index(drop=True)
+
+    confirm_n = max(1, int(cfg.confirm_days))
+    cooldown_n = max(0, int(cfg.cooldown_days))
+
+    final_estado: List[str] = []
+    final_accion: List[str] = []
+    final_com: List[str] = []
+
+    current_state = "NEUTRAL"
+    last_change_idx = -10**9  # índice del último cambio real
+
+    # tracking para confirmación
+    run_state = None
+    run_len = 0
+
+    for i, row in w.iterrows():
+        raw_state = str(row.get("raw_estado", "NEUTRAL") or "NEUTRAL")
+        desired = _desired_state_from_raw(raw_state)
+
+        # --- Confirmación (A) ---
+        if desired == run_state:
+            run_len += 1
+        else:
+            run_state = desired
+            run_len = 1
+
+        confirmed_desired = desired if run_len >= confirm_n else current_state
+
+        # --- Anti-flip (C) ---
+        if cfg.anti_flip:
+            if (current_state in ("SVIX", "UVIX")) and (confirmed_desired in ("SVIX", "UVIX")) and (confirmed_desired != current_state):
+                # obligamos a pasar por NEUTRAL
+                confirmed_desired = "NEUTRAL"
+
+        # --- Cooldown (B) ---
+        if cooldown_n > 0:
+            in_cooldown = (i - last_change_idx) < cooldown_n
+            # en cooldown, no permitimos cambios de estado
+            if in_cooldown and confirmed_desired != current_state:
+                confirmed_desired = current_state
+
+        # aplicamos cambio si procede
+        changed = (confirmed_desired != current_state)
+        if changed:
+            last_change_idx = i
+            current_state = confirmed_desired
+
+        # construimos acción/comentario finales
+        if current_state == "SVIX":
+            accion = "OPEN/HOLD SVIX"
+        elif current_state == "UVIX":
+            accion = "OPEN/HOLD UVIX"
+        else:
+            accion = "NO NEW POSITION"
+
+        # comentario final: explicamos filtros si han intervenido
+        raw_acc = str(row.get("raw_accion", "") or "")
+        raw_coment = str(row.get("raw_comentario", "") or "")
+
+        note_parts = []
+        if confirm_n > 1:
+            note_parts.append(f"confirm={confirm_n}")
+        if cooldown_n > 0:
+            note_parts.append(f"cooldown={cooldown_n}")
+        if cfg.anti_flip:
+            note_parts.append("anti_flip=on")
+
+        filt_note = (" | ".join(note_parts)).strip()
+
+        if current_state == _desired_state_from_raw(raw_state):
+            # señal raw y final coinciden
+            comentario = raw_coment
+        else:
+            # filtros han modulado la señal
+            comentario = f"[FILTRADA] raw={raw_state} ({raw_acc}). {raw_coment} | {filt_note}"
+
+        final_estado.append(current_state)
+        final_accion.append(accion)
+        final_com.append(comentario)
+
+    w["estado"] = final_estado
+    w["accion"] = final_accion
+    w["comentario"] = final_com
     return w
 
 
@@ -666,22 +659,24 @@ def upsert_vix_daily(df: pd.DataFrame) -> int:
         "contango_ok",
         "macro_tomorrow",
 
-        # RAW vs FINAL
-        "raw_estado", "raw_accion", "raw_comentario",
+        # FINAL
         "estado", "accion", "comentario",
+
+        # RAW (si existen en tu schema; si no, el upsert hará fallback y las quitará)
+        "raw_estado", "raw_accion", "raw_comentario",
 
         # OHLC operables
         "svix_open", "svix_high", "svix_low", "svix_close",
         "uvix_open", "uvix_high", "uvix_low", "uvix_close",
     ]
+
     w = w[[c for c in keep_cols if c in w.columns]].copy()
 
     records: List[Dict[str, Any]] = w.to_dict(orient="records")
     records = _json_sanitize_records(records)
 
-    resp = supabase.table("vix_daily").upsert(records, on_conflict="fecha").execute()
-    if getattr(resp, "error", None):
-        raise RuntimeError(resp.error)
+    # ✅ upsert con fallback si hay columnas que tu schema cache no conoce
+    _upsert_with_schema_fallback(table="vix_daily", records=records, on_conflict="fecha")
 
     return len(records)
 
