@@ -38,6 +38,18 @@ from backend.vix import (  # type: ignore
     update_vix_order_status,
 )
 
+# ✅ Motor de trading VIX (posiciones) — import seguro (no rompe la app si falta)
+VIX_TRADING_AVAILABLE = True
+try:
+    from backend.vix_trading import (  # type: ignore
+        run_vix_execution,
+        fetch_vix_positions,
+    )
+except Exception:
+    VIX_TRADING_AVAILABLE = False
+    run_vix_execution = None  # type: ignore
+    fetch_vix_positions = None  # type: ignore
+
 
 # ---------- CARGA HISTÓRICO (CACHEADO) ----------
 @st.cache_data(show_spinner="Cargando histórico y calculando estadísticas…")
@@ -898,7 +910,7 @@ def show_banca():
 
 
 # ======================================================================
-# VISTA: VIX (robusta: vix_daily + órdenes + export)
+# VISTA: VIX (robusta: vix_daily + órdenes + export + motor)
 # ======================================================================
 def show_vix():
     st.markdown("### VIX – régimen diario (SVIX / NEUTRAL / UVIX)")
@@ -1000,7 +1012,6 @@ def show_vix():
     if "fecha" in export_df.columns:
         export_df["fecha"] = pd.to_datetime(export_df["fecha"], errors="coerce").dt.date
 
-    # CSV “Excel España” => ; como separador
     csv_bytes = export_df.to_csv(index=False, sep=";", encoding="utf-8").encode("utf-8")
     st.download_button(
         "⬇️ Descargar CSV (formato Excel-friendly ;)",
@@ -1009,7 +1020,6 @@ def show_vix():
         mime="text/csv",
     )
 
-    # Excel xlsx
     try:
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -1072,7 +1082,6 @@ def show_vix():
             except Exception as e:
                 st.error(f"Error guardando orden: {e}")
 
-    # Listado + acciones rápidas
     try:
         orders = fetch_vix_orders(limit=300)
     except Exception as e:
@@ -1110,6 +1119,83 @@ def show_vix():
                 st.rerun()
             except Exception as e:
                 st.error(f"Error actualizando orden: {e}")
+
+    # --------------------------
+    # MOTOR VIX (vix_trading.py)
+    # --------------------------
+    st.markdown("---")
+    st.markdown("## Motor VIX (posiciones + reglas)")
+
+    if not VIX_TRADING_AVAILABLE:
+        st.warning("El motor VIX no está disponible: no se pudo importar backend/vix_trading.py.")
+        return
+
+    st.markdown(
+        """
+Este motor calcula/actualiza la tabla **vix_positions** aplicando reglas operables
+(mínimo 48h, stops/TP1/trailing, anti-flip, etc. según tu vix_trading.py).
+        """.strip()
+    )
+
+    if st.button("▶️ Ejecutar motor VIX (actualizar posiciones)"):
+        try:
+            assert run_vix_execution is not None
+            run_vix_execution()
+            st.success("Motor ejecutado. Posiciones actualizadas en Supabase (vix_positions).")
+            st.rerun()
+        except Exception as e:
+            st.exception(e)
+
+    # Tabla posiciones
+    try:
+        assert fetch_vix_positions is not None
+        pos = fetch_vix_positions(limit=500)
+    except Exception as e:
+        st.error(f"Error leyendo vix_positions: {e}")
+        pos = pd.DataFrame()
+
+    if pos.empty:
+        st.info("No hay posiciones todavía en vix_positions.")
+    else:
+        st.markdown("### Posiciones (vix_positions)")
+        # Orden y columnas “amables” si existen
+        if "fecha_entry" in pos.columns:
+            pos["fecha_entry"] = pd.to_datetime(pos["fecha_entry"], errors="coerce")
+        if "fecha_exit" in pos.columns:
+            pos["fecha_exit"] = pd.to_datetime(pos["fecha_exit"], errors="coerce")
+
+        # Intentamos ordenar por fecha_entry desc si existe
+        if "fecha_entry" in pos.columns:
+            pos_view = pos.sort_values("fecha_entry", ascending=False).copy()
+        else:
+            pos_view = pos.copy()
+
+        st.dataframe(pos_view, use_container_width=True)
+
+        st.markdown("### Exportar vix_positions")
+        export_pos = pos_view.copy()
+
+        # CSV “Excel España” => ; como separador
+        csv_pos = export_pos.to_csv(index=False, sep=";", encoding="utf-8").encode("utf-8")
+        st.download_button(
+            "⬇️ Descargar CSV posiciones (Excel-friendly ;)",
+            data=csv_pos,
+            file_name="vix_positions_export.csv",
+            mime="text/csv",
+        )
+
+        try:
+            buffer2 = io.BytesIO()
+            with pd.ExcelWriter(buffer2, engine="openpyxl") as writer:
+                export_pos.to_excel(writer, index=False, sheet_name="vix_positions")
+            st.download_button(
+                "⬇️ Descargar Excel posiciones (.xlsx)",
+                data=buffer2.getvalue(),
+                file_name="vix_positions_export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.warning(f"No se pudo generar Excel de posiciones: {e}")
 
 
 # ======================================================================
