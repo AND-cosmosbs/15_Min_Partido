@@ -1,43 +1,63 @@
 # backend/vix_trading.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from .supabase_client import supabase
-from .vix import fetch_vix_daily  # usamos tu vix.py existente (señales + paginación)
+from .vix import fetch_vix_daily  # usamos tu tabla vix_daily ya calculada
 
 
 # ============================================================
-# CONFIG CERRADA (la que ya venías usando)
+# Config de ejecución / reglas
 # ============================================================
 
 @dataclass
 class TradeRules:
-    # Mínimo 48h salvo excepción (STOP siempre manda)
-    min_hold_days: int = 2
-
-    # Parcial TP1
-    tp1_sell_fraction: float = 0.50  # 50%
-
-    # Reglas % por activo (diferentes)
-    svix_stop_pct: float = 0.04
-    svix_tp1_pct: float = 0.04   # TP1 más bajo (ajustable)
-    svix_trailing_pct: float = 0.03  # trailing más cerca (ajustable)
-
-    uvix_stop_pct: float = 0.08
-    uvix_tp1_pct: float = 0.10   # objetivo ~10%
-    uvix_trailing_pct: float = 0.06
+    stop_pct: float
+    tp1_pct: float
+    trailing_pct: float
+    tp1_take: float = 0.50          # % de posición que se vende en TP1
+    min_hold_days: int = 2          # 48h ~ 2 sesiones
+    max_hold_days_no_tp1: int = 5   # time-stop si no hay TP1
+    min_gain_to_keep_after_maxhold: float = 0.02  # +2% mínimo si no hay TP1
 
 
-DEFAULT_RULES = TradeRules()
+# Payoff-focused UVIX
+UVIX_RULES = TradeRules(
+    stop_pct=0.10,        # -10%
+    tp1_pct=0.10,         # +10%
+    trailing_pct=0.06,    # 6%
+    tp1_take=0.50,
+    min_hold_days=2,
+    max_hold_days_no_tp1=5,
+    min_gain_to_keep_after_maxhold=0.02,
+)
+
+# SVIX: NO lo tocamos aquí (si quieres, se parametriza igual, pero no lo cambio)
+# Lo dejo definido para no romper el motor si lo usas:
+SVIX_RULES = TradeRules(
+    stop_pct=0.04,
+    tp1_pct=0.06,
+    trailing_pct=0.04,
+    tp1_take=0.50,
+    min_hold_days=2,
+    max_hold_days_no_tp1=10,
+    min_gain_to_keep_after_maxhold=0.01,
+)
+
+RULES_BY_TICKER: Dict[str, TradeRules] = {
+    "UVIX": UVIX_RULES,
+    "SVIX": SVIX_RULES,
+}
 
 
-def _now_iso_date() -> str:
-    return pd.Timestamp.utcnow().date().isoformat()
-
+# ============================================================
+# Helpers
+# ============================================================
 
 def _json_sanitize_value(x: Any) -> Any:
     if x is None:
@@ -47,76 +67,98 @@ def _json_sanitize_value(x: Any) -> Any:
             return None
     except Exception:
         pass
+
     if isinstance(x, pd.Timestamp):
-        return x.date().isoformat()
+        # guardamos ISO date para columnas date; para timestamp usamos isoformat
+        if x.tzinfo is not None:
+            x = x.tz_convert(None)
+        return x.isoformat()
+
+    # dates python / datetime python
     if hasattr(x, "isoformat"):
         try:
             return x.isoformat()
         except Exception:
             return str(x)
-    if isinstance(x, (int, float, str, bool)):
-        return x
-    return str(x)
+
+    # numpy / pandas scalars
+    try:
+        import numpy as np
+        if isinstance(x, (np.integer,)):
+            return int(x)
+        if isinstance(x, (np.floating,)):
+            return float(x)
+        if isinstance(x, (np.bool_,)):
+            return bool(x)
+    except Exception:
+        pass
+
+    return x
 
 
 def _sanitize_payload(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: _json_sanitize_value(v) for k, v in d.items()}
 
 
+def _to_date(x: Any) -> Optional[pd.Timestamp]:
+    if x is None:
+        return None
+    t = pd.to_datetime(x, errors="coerce")
+    if pd.isna(t):
+        return None
+    return t.normalize()
+
+
+def _num(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+        if pd.isna(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _safe_col(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series([pd.NA] * len(df), index=df.index)
+    return df[col]
+
+
+def _get_ohlc_for_ticker(row: pd.Series, ticker: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    t = (ticker or "").upper().strip()
+    prefix = "uvix" if t == "UVIX" else "svix"
+    o = _num(row.get(f"{prefix}_open"))
+    h = _num(row.get(f"{prefix}_high"))
+    l = _num(row.get(f"{prefix}_low"))
+    c = _num(row.get(f"{prefix}_close"))
+    return o, h, l, c
+
+
 # ============================================================
-# SUPABASE CRUD: vix_positions
+# Supabase I/O: vix_positions
 # ============================================================
 
-def fetch_vix_positions(limit: int = 200) -> pd.DataFrame:
-    resp = (
-        supabase.table("vix_positions")
-        .select("*")
-        .order("id", desc=True)
-        .limit(limit)
-        .execute()
-    )
+def fetch_vix_positions(limit: int = 500) -> pd.DataFrame:
+    resp = supabase.table("vix_positions").select("*").order("entry_date", desc=True).limit(limit).execute()
     if getattr(resp, "error", None):
         raise RuntimeError(resp.error)
+
     data = getattr(resp, "data", None) or []
     df = pd.DataFrame(data)
+    # normalizamos fechas a pandas (naive)
     for c in ["entry_signal_date", "entry_date", "exit_date", "created_at", "updated_at"]:
-        if c in df.columns:
+        if c in df.columns and not df.empty:
             df[c] = pd.to_datetime(df[c], errors="coerce")
+            # quitamos tz si viene con tz (para exportar a Excel sin error)
+            try:
+                df[c] = df[c].dt.tz_localize(None)
+            except Exception:
+                pass
     return df
 
 
-def fetch_open_position() -> Optional[Dict[str, Any]]:
-    resp = (
-        supabase.table("vix_positions")
-        .select("*")
-        .eq("status", "OPEN")
-        .order("id", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if getattr(resp, "error", None):
-        raise RuntimeError(resp.error)
-    data = getattr(resp, "data", None) or []
-    return data[0] if data else None
-
-
-def fetch_open_or_partial_position() -> Optional[Dict[str, Any]]:
-    # Si estás PARTIAL también es posición viva
-    resp = (
-        supabase.table("vix_positions")
-        .select("*")
-        .in_("status", ["OPEN", "PARTIAL"])
-        .order("id", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if getattr(resp, "error", None):
-        raise RuntimeError(resp.error)
-    data = getattr(resp, "data", None) or []
-    return data[0] if data else None
-
-
-def insert_position(payload: Dict[str, Any]) -> int:
+def _insert_position(payload: Dict[str, Any]) -> int:
     payload = _sanitize_payload(payload)
     resp = supabase.table("vix_positions").insert(payload).execute()
     if getattr(resp, "error", None):
@@ -127,9 +169,7 @@ def insert_position(payload: Dict[str, Any]) -> int:
     return 1
 
 
-def update_position(pos_id: int, patch: Dict[str, Any]) -> None:
-    patch = dict(patch)
-    patch["updated_at"] = _now_iso_date()
+def _update_position(pos_id: int, patch: Dict[str, Any]) -> None:
     patch = _sanitize_payload(patch)
     resp = supabase.table("vix_positions").update(patch).eq("id", int(pos_id)).execute()
     if getattr(resp, "error", None):
@@ -137,297 +177,273 @@ def update_position(pos_id: int, patch: Dict[str, Any]) -> None:
 
 
 # ============================================================
-# UTILIDADES TRADE
+# Motor principal
 # ============================================================
 
-def _rules_for_ticker(ticker: str, rules: TradeRules) -> Tuple[float, float, float]:
-    t = (ticker or "").upper().strip()
-    if t == "UVIX":
-        return rules.uvix_stop_pct, rules.uvix_tp1_pct, rules.uvix_trailing_pct
-    return rules.svix_stop_pct, rules.svix_tp1_pct, rules.svix_trailing_pct
-
-
-def _ohlc_cols(ticker: str) -> Tuple[str, str, str, str]:
-    p = (ticker or "").lower().strip()
-    return f"{p}_open", f"{p}_high", f"{p}_low", f"{p}_close"
-
-
-def _get_ohlc_row(daily_row: pd.Series, ticker: str) -> Dict[str, Optional[float]]:
-    c_open, c_high, c_low, c_close = _ohlc_cols(ticker)
-    out = {
-        "open": daily_row.get(c_open),
-        "high": daily_row.get(c_high),
-        "low": daily_row.get(c_low),
-        "close": daily_row.get(c_close),
-    }
-    # normaliza a float/None
-    for k, v in list(out.items()):
-        try:
-            out[k] = float(v) if pd.notna(v) else None
-        except Exception:
-            out[k] = None
-    return out
-
-
-def _days_held(entry_date: Optional[pd.Timestamp], current_date: pd.Timestamp) -> int:
-    if entry_date is None or pd.isna(entry_date):
-        return 0
-    try:
-        return int((current_date.date() - entry_date.date()).days)
-    except Exception:
-        return 0
-
-
-# ============================================================
-# MOTOR “CERRADO” (sin subjetividad)
-# - Entrada: señal de vix_daily (accion/estado)
-# - Ejecución: al OPEN del día siguiente si hay datos OHLC
-# - Gestión: stop / tp1 / trailing con HIGH/LOW diario
-# - Restricción: mínimo 48h para TP1/trailing (STOP siempre manda)
-# ============================================================
-
-def _desired_ticker_from_signal(row: pd.Series) -> Optional[str]:
-    estado = str(row.get("estado", "") or "").upper().strip()
-    accion = str(row.get("accion", "") or "").upper().strip()
-
-    if "NO DATA" in accion or "NO NEW" in accion:
-        return None
-
-    # Señales que implican estar largos
-    if "SVIX" in estado:
-        return "SVIX"
-    if "UVIX" in estado:
-        return "UVIX"
-
-    return None
-
-
-def run_vix_execution(
-    rules: TradeRules = DEFAULT_RULES,
-    capital_usd: float = 10000.0,
-    max_rows: int = 5000,
-) -> Dict[str, Any]:
+def run_vix_execution() -> None:
     """
-    Ejecuta gestión completa recorriendo vix_daily en orden temporal:
-    - Si no hay posición viva, abre cuando haya señal (al open del día siguiente).
-    - Si hay posición, aplica stop/tp1/trailing y evita flip inmediato.
-    - Respeta 48h mínimo para TP1/trailing (stop siempre).
+    Motor: lee vix_daily + posiciones y aplica reglas.
+    - No rompe SVIX: solo aplica reglas si hay posición OPEN.
+    - Crea nuevas posiciones cuando estado = UVIX o SVIX, si no hay OPEN.
     """
 
     daily = fetch_vix_daily()
-    if daily is None or daily.empty:
-        return {"ok": False, "msg": "vix_daily vacío.", "opened": 0, "closed": 0, "partial": 0}
+    if daily.empty:
+        return
 
-    # orden por fecha
+    # Aseguramos fecha y orden
     if "fecha" not in daily.columns:
-        return {"ok": False, "msg": "vix_daily no tiene columna 'fecha'.", "opened": 0, "closed": 0, "partial": 0}
-
+        raise RuntimeError("vix_daily no tiene columna 'fecha'")
     daily = daily.copy()
-    daily["fecha"] = pd.to_datetime(daily["fecha"], errors="coerce")
-    daily = daily.dropna(subset=["fecha"]).sort_values("fecha").tail(max_rows)
+    daily["fecha"] = pd.to_datetime(daily["fecha"], errors="coerce").dt.normalize()
+    daily = daily.dropna(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
 
-    opened = 0
-    closed = 0
-    partial = 0
+    # Posiciones actuales
+    pos_df = fetch_vix_positions(limit=2000)
+    if pos_df.empty:
+        pos_df = pd.DataFrame(columns=[
+            "id","ticker","status","entry_signal_date","entry_date","entry_price","qty","capital_usd",
+            "stop_pct","tp1_pct","trailing_pct","tp1_taken","trailing_active",
+            "hard_stop_price","tp1_price","trail_price","high_watermark",
+            "exit_date","exit_price","pl_usd","pl_pct","notes",
+        ])
 
-    pos = fetch_open_or_partial_position()
+    # Buscar si hay OPEN por ticker
+    open_pos = {}
+    if "status" in pos_df.columns and "ticker" in pos_df.columns:
+        for tkr in ["UVIX", "SVIX"]:
+            w = pos_df[(pos_df["ticker"] == tkr) & (pos_df["status"] == "OPEN")].copy()
+            if not w.empty:
+                # si hubiese más de una por error, cogemos la más reciente
+                w = w.sort_values("entry_date", ascending=False)
+                open_pos[tkr] = w.iloc[0].to_dict()
 
-    # Recorremos día a día
-    for i in range(len(daily) - 1):  # hasta penúltimo (porque entrada usa día siguiente open)
-        row = daily.iloc[i]
-        next_row = daily.iloc[i + 1]
+    # Recorremos días y aplicamos:
+    # 1) entradas al OPEN del día siguiente (basado en señal del día anterior)
+    # 2) gestión de stops/tp/trailing en días posteriores
+    for i in range(1, len(daily)):
+        prev = daily.iloc[i - 1]
+        cur = daily.iloc[i]
 
-        d = pd.to_datetime(row["fecha"])
-        d_next = pd.to_datetime(next_row["fecha"])
+        prev_state = str(prev.get("estado", "NEUTRAL") or "NEUTRAL").upper().strip()
+        cur_date = _to_date(cur.get("fecha"))
+        if cur_date is None:
+            continue
 
-        desired = _desired_ticker_from_signal(row)
+        # =========================
+        # ENTRADAS (si no hay OPEN)
+        # =========================
+        for tkr in ["UVIX", "SVIX"]:
+            if tkr in open_pos:
+                continue  # ya hay una abierta
 
-        # --- Si NO hay posición viva: abrir al open del día siguiente si hay señal ---
-        if pos is None:
-            if desired is None:
+            if prev_state != tkr:
                 continue
 
-            ohlc_next = _get_ohlc_row(next_row, desired)
-            entry_px = ohlc_next["open"]
-            if entry_px is None:
-                continue  # no podemos ejecutar sin open
+            # Entramos al open de hoy (cur)
+            o, h, l, c = _get_ohlc_for_ticker(cur, tkr)
+            if o is None:
+                # si no hay open, no se puede simular entrada
+                continue
 
-            stop_pct, tp1_pct, tr_pct = _rules_for_ticker(desired, rules)
+            rules = RULES_BY_TICKER.get(tkr)
+            if rules is None:
+                continue
 
-            hard_stop = entry_px * (1.0 - stop_pct)
-            tp1_price = entry_px * (1.0 + tp1_pct)
+            entry_price = float(o)
+            capital_usd = 10000.0  # si tú lo calculas fuera, aquí podrías leer NAV; lo dejamos fijo por sistema
+            qty = capital_usd / entry_price if entry_price > 0 else 0.0
+
+            hard_stop_price = entry_price * (1.0 - rules.stop_pct)
+            tp1_price = entry_price * (1.0 + rules.tp1_pct)
 
             payload = {
-                "ticker": desired,
+                "ticker": tkr,
                 "status": "OPEN",
-                "entry_signal_date": d.date(),
-                "entry_date": d_next.date(),
-                "entry_price": float(entry_px),
-                "qty": float(capital_usd / entry_px) if entry_px > 0 else None,
-                "capital_usd": float(capital_usd),
-
-                "stop_pct": float(stop_pct),
-                "tp1_pct": float(tp1_pct),
-                "trailing_pct": float(tr_pct),
-
+                "entry_signal_date": _to_date(prev.get("fecha")).date().isoformat() if _to_date(prev.get("fecha")) is not None else None,
+                "entry_date": cur_date.date().isoformat(),
+                "entry_price": entry_price,
+                "qty": qty,
+                "capital_usd": capital_usd,
+                "stop_pct": rules.stop_pct,
+                "tp1_pct": rules.tp1_pct,
+                "trailing_pct": rules.trailing_pct,
                 "tp1_taken": False,
                 "trailing_active": False,
-
-                "hard_stop_price": float(hard_stop),
-                "tp1_price": float(tp1_price),
+                "hard_stop_price": hard_stop_price,
+                "tp1_price": tp1_price,
                 "trail_price": None,
-                "high_watermark": float(entry_px),
-
-                "notes": f"AUTO OPEN from signal {row.get('estado','')}/{row.get('accion','')}",
+                "high_watermark": entry_price,
+                "notes": f"Auto-entry. prev_estado={prev_state}",
             }
 
-            pos_id = insert_position(payload)
-            pos = {"id": pos_id, **payload}
-            opened += 1
-            continue
+            new_id = _insert_position(payload)
+            payload["id"] = new_id
+            open_pos[tkr] = payload
 
-        # --- Si hay posición viva: gestionarla con OHLC del día SIGUIENTE a entry_date en adelante ---
-        pos_id = int(pos["id"])
-        ticker = str(pos.get("ticker", "")).upper().strip()
-        entry_date = pd.to_datetime(pos.get("entry_date"), errors="coerce")
-
-        # Sólo gestionar si ya estamos "dentro" (d >= entry_date)
-        if pd.isna(entry_date) or d.date() < entry_date.date():
-            continue
-
-        ohlc_today = _get_ohlc_row(row, ticker)
-        if ohlc_today["low"] is None or ohlc_today["high"] is None:
-            continue  # sin high/low no hay stops intradía
-
-        low = float(ohlc_today["low"])
-        high = float(ohlc_today["high"])
-        close_px = float(ohlc_today["close"]) if ohlc_today["close"] is not None else None
-
-        # update high watermark
-        hwm = pos.get("high_watermark")
-        try:
-            hwm = float(hwm) if hwm is not None else float(pos["entry_price"])
-        except Exception:
-            hwm = float(pos["entry_price"])
-
-        if high > hwm:
-            hwm = high
-
-        hard_stop = float(pos.get("hard_stop_price") or 0.0)
-        tp1_price = float(pos.get("tp1_price") or 0.0)
-        trail_price = pos.get("trail_price")
-        trail_price = float(trail_price) if trail_price is not None else None
-
-        tp1_taken = bool(pos.get("tp1_taken") or False)
-        trailing_active = bool(pos.get("trailing_active") or False)
-
-        # regla 48h (para TP1/trailing). STOP siempre manda.
-        held_days = _days_held(entry_date, d)
-
-        # 1) STOP (excepción: se ejecuta siempre)
-        if hard_stop > 0 and low <= hard_stop:
-            exit_px = hard_stop  # asumimos fill al nivel
-            entry_px = float(pos["entry_price"])
-            pl_pct = (exit_px / entry_px) - 1.0
-            pl_usd = float(pos.get("capital_usd") or 0.0) * pl_pct
-
-            update_position(pos_id, {
-                "status": "CLOSED",
-                "exit_date": d.date(),
-                "exit_price": float(exit_px),
-                "pl_pct": float(pl_pct),
-                "pl_usd": float(pl_usd),
-                "high_watermark": float(hwm),
-                "trail_price": float(trail_price) if trail_price is not None else None,
-                "notes": (pos.get("notes") or "") + " | AUTO STOP",
-            })
-            pos = None
-            closed += 1
-            continue
-
-        # 2) TP1 + activar trailing (solo si held_days >= min_hold_days)
-        if (held_days >= rules.min_hold_days) and (not tp1_taken) and (tp1_price > 0) and (high >= tp1_price):
-            # tomamos parcial al tp1_price
-            update_position(pos_id, {
-                "status": "PARTIAL",
-                "tp1_taken": True,
-                "trailing_active": True,
-                "high_watermark": float(hwm),
-                "notes": (pos.get("notes") or "") + f" | AUTO TP1 {rules.tp1_sell_fraction*100:.0f}%",
-            })
-            # set trail basado en HWM tras TP1
-            tr_pct = float(pos.get("trailing_pct") or 0.0)
-            trail_price = hwm * (1.0 - tr_pct) if tr_pct > 0 else None
-            if trail_price is not None:
-                update_position(pos_id, {"trail_price": float(trail_price)})
-
-            pos["status"] = "PARTIAL"
-            pos["tp1_taken"] = True
-            pos["trailing_active"] = True
-            pos["high_watermark"] = hwm
-            pos["trail_price"] = trail_price
-            partial += 1
-            # seguimos al siguiente día
-            continue
-
-        # 3) Trailing update + exit (solo si held_days >= min_hold_days)
-        if (held_days >= rules.min_hold_days) and trailing_active:
-            tr_pct = float(pos.get("trailing_pct") or 0.0)
-            if tr_pct > 0:
-                new_trail = hwm * (1.0 - tr_pct)
-                if trail_price is None or new_trail > trail_price:
-                    trail_price = new_trail
-                    update_position(pos_id, {"trail_price": float(trail_price), "high_watermark": float(hwm)})
-
-                # salida por trailing si low toca trail
-                if trail_price is not None and low <= trail_price:
-                    exit_px = float(trail_price)
-                    entry_px = float(pos["entry_price"])
-                    pl_pct = (exit_px / entry_px) - 1.0
-                    pl_usd = float(pos.get("capital_usd") or 0.0) * pl_pct
-
-                    update_position(pos_id, {
-                        "status": "CLOSED",
-                        "exit_date": d.date(),
-                        "exit_price": float(exit_px),
-                        "pl_pct": float(pl_pct),
-                        "pl_usd": float(pl_usd),
-                        "high_watermark": float(hwm),
-                        "trail_price": float(trail_price),
-                        "notes": (pos.get("notes") or "") + " | AUTO TRAIL EXIT",
-                    })
-                    pos = None
-                    closed += 1
-                    continue
-
-        # 4) Anti-flip: NO cerramos solo por “cambio de estado”,
-        # salvo que la señal sea explícitamente el otro ticker y ya cumplimos 48h.
-        if desired is not None and desired != ticker and (held_days >= rules.min_hold_days):
-            # cerramos al CLOSE de hoy (o al close disponible) y ya se abrirá el otro mañana vía señal
-            if close_px is not None:
-                exit_px = close_px
-                entry_px = float(pos["entry_price"])
-                pl_pct = (exit_px / entry_px) - 1.0
-                pl_usd = float(pos.get("capital_usd") or 0.0) * pl_pct
-
-                update_position(pos_id, {
-                    "status": "CLOSED",
-                    "exit_date": d.date(),
-                    "exit_price": float(exit_px),
-                    "pl_pct": float(pl_pct),
-                    "pl_usd": float(pl_usd),
-                    "high_watermark": float(hwm),
-                    "trail_price": float(trail_price) if trail_price is not None else None,
-                    "notes": (pos.get("notes") or "") + f" | AUTO FLIP EXIT -> {desired}",
-                })
-                pos = None
-                closed += 1
+        # =========================
+        # GESTIÓN DE POSICIONES OPEN
+        # =========================
+        for tkr, pos in list(open_pos.items()):
+            if str(pos.get("status", "")).upper().strip() != "OPEN":
                 continue
 
-        # persist watermark (si cambió)
-        update_position(pos_id, {
-            "high_watermark": float(hwm),
-        })
-        pos["high_watermark"] = hwm
+            entry_date = _to_date(pos.get("entry_date"))
+            if entry_date is None:
+                continue
 
-    return {"ok": True, "msg": "Execution done", "opened": opened, "closed": closed, "partial": partial}
+            rules = RULES_BY_TICKER.get(tkr)
+            if rules is None:
+                continue
+
+            days_in_trade = (cur_date - entry_date).days  # sesiones aprox.
+            allow_exits = days_in_trade >= rules.min_hold_days
+
+            entry_price = float(pos.get("entry_price") or 0.0)
+            qty = float(pos.get("qty") or 0.0)
+
+            hard_stop_price = _num(pos.get("hard_stop_price"))
+            tp1_price = _num(pos.get("tp1_price"))
+            trailing_pct = float(pos.get("trailing_pct") or rules.trailing_pct)
+
+            tp1_taken = bool(pos.get("tp1_taken") is True)
+            trailing_active = bool(pos.get("trailing_active") is True)
+            high_watermark = _num(pos.get("high_watermark")) or entry_price
+
+            o, h, l, c = _get_ohlc_for_ticker(cur, tkr)
+            if o is None and h is None and l is None and c is None:
+                continue
+
+            # actualizar high watermark si hay high
+            if h is not None:
+                high_watermark = max(high_watermark, float(h))
+
+            # calcular trail_price si trailing activo
+            trail_price = _num(pos.get("trail_price"))
+            if trailing_active:
+                trail_price = high_watermark * (1.0 - trailing_pct)
+
+            # ------------------------------------------------------------
+            # 1) HARD STOP (excepción: se permite aunque no haya 48h)
+            # ------------------------------------------------------------
+            exit_reason = None
+            exit_price = None
+
+            if hard_stop_price is not None:
+                # gap down: si open ya está por debajo del stop => ejecuta a open
+                if o is not None and float(o) <= float(hard_stop_price):
+                    exit_reason = "HARD_STOP_GAP"
+                    exit_price = float(o)
+                # intradía toca stop
+                elif l is not None and float(l) <= float(hard_stop_price):
+                    exit_reason = "HARD_STOP"
+                    exit_price = float(hard_stop_price)
+
+            # ------------------------------------------------------------
+            # 2) TP1 (solo si allow_exits)
+            # ------------------------------------------------------------
+            tp1_exec = False
+            if exit_reason is None and allow_exits and (not tp1_taken) and tp1_price is not None:
+                if h is not None and float(h) >= float(tp1_price):
+                    tp1_exec = True
+
+            # ------------------------------------------------------------
+            # 3) Trailing stop (solo si allow_exits y trailing activo)
+            # ------------------------------------------------------------
+            if exit_reason is None and allow_exits and trailing_active and trail_price is not None:
+                # gap: si open <= trail => salida a open
+                if o is not None and float(o) <= float(trail_price):
+                    exit_reason = "TRAIL_GAP"
+                    exit_price = float(o)
+                elif l is not None and float(l) <= float(trail_price):
+                    exit_reason = "TRAIL"
+                    exit_price = float(trail_price)
+
+            # ------------------------------------------------------------
+            # 4) Time-stop si no hay TP1 tras X días
+            # ------------------------------------------------------------
+            if exit_reason is None and allow_exits and (not tp1_taken):
+                if days_in_trade >= rules.max_hold_days_no_tp1:
+                    if c is not None and entry_price > 0:
+                        if float(c) < entry_price * (1.0 + rules.min_gain_to_keep_after_maxhold):
+                            exit_reason = "TIME_STOP"
+                            exit_price = float(c)
+
+            # ------------------------------------------------------------
+            # 5) Regime exit: si UVIX se apaga 2 días seguidos (solo allow_exits)
+            # ------------------------------------------------------------
+            if exit_reason is None and allow_exits:
+                # comprobamos el estado de los 2 últimos cierres (prev y cur)
+                cur_state = str(cur.get("estado", "NEUTRAL") or "NEUTRAL").upper().strip()
+                prev2_state = str(prev.get("estado", "NEUTRAL") or "NEUTRAL").upper().strip()
+                if tkr == "UVIX":
+                    if (prev2_state != "UVIX") and (cur_state != "UVIX"):
+                        # salida a open del día actual (cur)
+                        if o is not None:
+                            exit_reason = "REGIME_OFF"
+                            exit_price = float(o)
+
+            # ------------------------------------------------------------
+            # Aplicar TP1 (si toca)
+            # ------------------------------------------------------------
+            if tp1_exec:
+                # vendemos rules.tp1_take del qty
+                qty_left = qty * (1.0 - rules.tp1_take)
+                _update_position(int(pos["id"]), {
+                    "tp1_taken": True,
+                    "trailing_active": True,          # activamos trailing tras TP1
+                    "high_watermark": high_watermark,
+                    "trail_price": high_watermark * (1.0 - trailing_pct),
+                    "qty": qty_left,                  # dejamos solo la mitad
+                    "notes": (str(pos.get("notes") or "") + f" | TP1 hit @ {tp1_price:.4f}").strip(),
+                })
+                # refrescamos el dict local
+                pos["tp1_taken"] = True
+                pos["trailing_active"] = True
+                pos["high_watermark"] = high_watermark
+                pos["trail_price"] = high_watermark * (1.0 - trailing_pct)
+                pos["qty"] = qty_left
+
+                # IMPORTANTE: en el mismo día, NO forzamos salida del resto por trailing.
+                # Seguimos al siguiente día.
+
+            # ------------------------------------------------------------
+            # Cerrar posición (si hay exit_reason)
+            # ------------------------------------------------------------
+            if exit_reason is not None and exit_price is not None:
+                # P/L aproximado sobre lo que quede (qty actual)
+                qty_now = float(pos.get("qty") or 0.0)
+                pl_usd = (float(exit_price) - entry_price) * qty_now
+                pl_pct = (float(exit_price) / entry_price - 1.0) if entry_price > 0 else None
+
+                _update_position(int(pos["id"]), {
+                    "status": "CLOSED",
+                    "exit_date": cur_date.date().isoformat(),
+                    "exit_price": float(exit_price),
+                    "pl_usd": float(pl_usd),
+                    "pl_pct": float(pl_pct) if pl_pct is not None else None,
+                    "high_watermark": high_watermark,
+                    "trail_price": trail_price,
+                    "notes": (str(pos.get("notes") or "") + f" | EXIT {exit_reason} @ {exit_price:.4f}").strip(),
+                })
+
+                # sacamos de open_pos
+                open_pos.pop(tkr, None)
+                continue
+
+            # ------------------------------------------------------------
+            # Si sigue OPEN: actualizar watermark/trail si aplica
+            # ------------------------------------------------------------
+            patch = {"high_watermark": high_watermark}
+            if trailing_active:
+                patch["trail_price"] = high_watermark * (1.0 - trailing_pct)
+            _update_position(int(pos["id"]), patch)
+
+            # refresco local
+            pos["high_watermark"] = high_watermark
+            if trailing_active:
+                pos["trail_price"] = patch["trail_price"]
+
+
+# alias (por si tu main importaba otro nombre en alguna iteración)
+run_vix_execution = run_vix_execution
