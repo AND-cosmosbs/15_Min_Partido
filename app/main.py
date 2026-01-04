@@ -66,7 +66,7 @@ def _fetch_vix_daily_cached():
 
 
 # ======================================================================
-# HELPERS (ROI / RAROC / BANCA)
+# HELPERS (Excel / ROI / RAROC / BANCA)
 # ======================================================================
 
 def _safe_numeric(df: pd.DataFrame, col: str) -> None:
@@ -81,6 +81,52 @@ def _safe_int_default(value, default: int = 0) -> int:
         return int(float(value))
     except Exception:
         return default
+
+
+def _excel_make_tz_naive_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Excel NO soporta datetimes con timezone.
+    Este helper convierte cualquier columna datetime tz-aware a tz-naive.
+    También intenta sanear columnas object que contengan datetimes tz-aware.
+    """
+    out = df.copy()
+
+    # 1) Columnas datetime64 con tz (dtype)
+    try:
+        from pandas.api.types import is_datetime64tz_dtype
+        for c in list(out.columns):
+            if is_datetime64tz_dtype(out[c]):
+                out[c] = pd.to_datetime(out[c], errors="coerce").dt.tz_localize(None)
+    except Exception:
+        # Si por lo que sea falla el import, seguimos con el fallback de abajo
+        pass
+
+    # 2) Fallback para columnas object con timestamps tz-aware dentro
+    for c in list(out.columns):
+        if out[c].dtype == "object":
+            # Solo actuamos si detectamos algún tz-aware
+            sample = out[c].dropna().head(25).tolist()
+            has_tz = False
+            for v in sample:
+                try:
+                    # pandas.Timestamp con tz
+                    if isinstance(v, pd.Timestamp) and v.tz is not None:
+                        has_tz = True
+                        break
+                    # datetime python con tzinfo
+                    if hasattr(v, "tzinfo") and v.tzinfo is not None:
+                        has_tz = True
+                        break
+                except Exception:
+                    continue
+
+            if has_tz:
+                # Convertimos a datetime y quitamos tz
+                s = pd.to_datetime(out[c], errors="coerce", utc=True)
+                # utc=True -> tz-aware; lo dejamos tz-naive
+                out[c] = s.dt.tz_localize(None)
+
+    return out
 
 
 def _compute_total_stake(df: pd.DataFrame) -> pd.Series:
@@ -1022,8 +1068,9 @@ def show_vix():
 
     try:
         buffer = io.BytesIO()
+        export_df_xlsx = _excel_make_tz_naive_df(export_df)
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            export_df.to_excel(writer, index=False, sheet_name="vix_daily")
+            export_df_xlsx.to_excel(writer, index=False, sheet_name="vix_daily")
         st.download_button(
             "⬇️ Descargar Excel (.xlsx)",
             data=buffer.getvalue(),
@@ -1158,17 +1205,15 @@ Este motor calcula/actualiza la tabla **vix_positions** aplicando reglas operabl
         st.info("No hay posiciones todavía en vix_positions.")
     else:
         st.markdown("### Posiciones (vix_positions)")
-        # Orden y columnas “amables” si existen
-        if "fecha_entry" in pos.columns:
-            pos["fecha_entry"] = pd.to_datetime(pos["fecha_entry"], errors="coerce")
-        if "fecha_exit" in pos.columns:
-            pos["fecha_exit"] = pd.to_datetime(pos["fecha_exit"], errors="coerce")
+        pos_view = pos.copy()
 
-        # Intentamos ordenar por fecha_entry desc si existe
-        if "fecha_entry" in pos.columns:
-            pos_view = pos.sort_values("fecha_entry", ascending=False).copy()
-        else:
-            pos_view = pos.copy()
+        # Ordenamos si existe fecha_entry
+        if "fecha_entry" in pos_view.columns:
+            pos_view["fecha_entry"] = pd.to_datetime(pos_view["fecha_entry"], errors="coerce")
+            pos_view = pos_view.sort_values("fecha_entry", ascending=False)
+
+        if "fecha_exit" in pos_view.columns:
+            pos_view["fecha_exit"] = pd.to_datetime(pos_view["fecha_exit"], errors="coerce")
 
         st.dataframe(pos_view, use_container_width=True)
 
@@ -1186,8 +1231,9 @@ Este motor calcula/actualiza la tabla **vix_positions** aplicando reglas operabl
 
         try:
             buffer2 = io.BytesIO()
+            export_pos_xlsx = _excel_make_tz_naive_df(export_pos)
             with pd.ExcelWriter(buffer2, engine="openpyxl") as writer:
-                export_pos.to_excel(writer, index=False, sheet_name="vix_positions")
+                export_pos_xlsx.to_excel(writer, index=False, sheet_name="vix_positions")
             st.download_button(
                 "⬇️ Descargar Excel posiciones (.xlsx)",
                 data=buffer2.getvalue(),
