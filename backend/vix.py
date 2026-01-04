@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Iterable, Tuple
-import re
+from typing import Optional, Dict, Any, List, Iterable
 
 import numpy as np
 import pandas as pd
@@ -25,26 +24,6 @@ class VixConfig:
     # Guardarraíl “VIX demasiado bajo”
     use_guardrail: bool = True
     guardrail_vix_floor: float = 12.5  # si VIX < 12.5 => no abrir SVIX
-
-    # =========================
-    # A) Confirmación anti-ruido
-    # =========================
-    confirm_days: int = 2  # requiere N días seguidos del mismo "raw_estado" para cambiar
-
-    # =========================
-    # B) Cooldown anti-latigazos
-    # =========================
-    cooldown_days: int = 3  # tras un cambio "real" de régimen, no volver a cambiar durante N días
-
-    # =========================
-    # C) Anti-flip SVIX<->UVIX
-    # =========================
-    anti_flip: bool = True  # si True, impide pasar directo SVIX<->UVIX; obliga a pasar por NEUTRAL
-
-    # UVIX solo pánico real
-    uvix_spy_panic_thresh: float = -0.012  # -1.2% (spy_ret <= -0.012)
-    uvix_min_score: int = 3  # requiere score >= 3
-    uvix_require_vix_extreme: bool = True  # requiere vix > p85
 
 
 DEFAULT_CFG = VixConfig()
@@ -200,56 +179,6 @@ def _supabase_select_all(
     return out
 
 
-def _extract_missing_column_from_postgrest_error(msg: str) -> Optional[str]:
-    """
-    Ej:
-    "Could not find the 'vxx' column of 'vix_daily' in the schema cache"
-    """
-    if not msg:
-        return None
-    m = re.search(r"Could not find the '([^']+)' column", msg)
-    if m:
-        return m.group(1)
-    return None
-
-
-def _upsert_with_schema_fallback(table: str, records: List[Dict[str, Any]], on_conflict: str) -> None:
-    """
-    Si Supabase/PostgREST se queja de una columna que no existe en el schema cache,
-    reintentamos quitando esa columna de todos los records.
-    """
-    if not records:
-        return
-
-    # Reintento en bucle por si hay varias columnas conflictivas
-    max_tries = 8
-    current = records
-
-    for _ in range(max_tries):
-        resp = supabase.table(table).upsert(current, on_conflict=on_conflict).execute()
-        err = getattr(resp, "error", None)
-        if not err:
-            return
-
-        err_str = str(err)
-        missing = _extract_missing_column_from_postgrest_error(err_str)
-        if not missing:
-            raise RuntimeError(err)
-
-        # quitamos esa col y reintentamos
-        new_records: List[Dict[str, Any]] = []
-        for r in current:
-            if missing in r:
-                r = dict(r)
-                r.pop(missing, None)
-            new_records.append(r)
-
-        current = new_records
-
-    # si agota reintentos
-    raise RuntimeError("Upsert falló tras reintentos por columnas inexistentes en schema cache.")
-
-
 # -----------------------------
 # Supabase: macro events
 # -----------------------------
@@ -392,7 +321,7 @@ def download_trade_ohlc(start: str, end: str) -> pd.DataFrame:
 
 
 # -----------------------------
-# Señales y estado (RAW)
+# Señales y estado
 # -----------------------------
 
 def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
@@ -428,6 +357,7 @@ def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataF
 
 def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, Any]:
     vix = row.get("vix")
+    p10 = row.get("vix_p10")
     p25 = row.get("vix_p25")
     p65 = row.get("vix_p65")
     p85 = row.get("vix_p85")
@@ -438,9 +368,11 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
     spy_ret = row.get("spy_ret")
     macro_tomorrow = bool(row.get("macro_tomorrow")) if pd.notna(row.get("macro_tomorrow")) else False
 
-    if pd.isna(p25) or pd.isna(p65) or pd.isna(p85) or pd.isna(vix):
+    # Sin percentiles aún => no operar
+    if pd.isna(p10) or pd.isna(p25) or pd.isna(p65) or pd.isna(p85) or pd.isna(vix):
         return {"estado": "NEUTRAL", "accion": "NO DATA", "comentario": "Insuficiente histórico para rolling 252."}
 
+    # Guardarraíl VIX demasiado bajo
     if cfg.use_guardrail and pd.notna(vix) and float(vix) < float(cfg.guardrail_vix_floor):
         return {
             "estado": "NEUTRAL",
@@ -448,42 +380,49 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
             "comentario": "Guardarraíl: VIX extremadamente bajo (riesgo snapback).",
         }
 
-    # SVIX (calma + contango + sin macro mañana)
+    # =========================================================
+    # ✅ A1 + A2: SVIX solo en calma EXTREMA (p10) + SPY filtro
+    # =========================================================
+    # A2: evitamos abrir/seguir SVIX si SPY cae fuerte hoy (riesgo de latigazo)
+    spy_ok_for_svix = (pd.notna(spy_ret) and float(spy_ret) > -0.004)  # > -0.4%
+
     cond_svix = (
-        (vix < p25)
+        (vix < p10)  # A1: p10 (antes p25)
         and (pd.notna(ratio) and ratio < cfg.ratio_ok)
         and contango_ok
         and (macro_tomorrow is False)
+        and spy_ok_for_svix  # A2
     )
     if cond_svix:
-        return {"estado": "SVIX", "accion": "OPEN/HOLD SVIX", "comentario": "Calma + contango + sin macro mañana."}
+        return {
+            "estado": "SVIX",
+            "accion": "OPEN/HOLD SVIX",
+            "comentario": "SVIX: calma extrema (VIX < p10) + contango + ratio OK + SPY no cae fuerte + sin macro mañana.",
+        }
 
-    # UVIX: condiciones base (score)
-    uvix_cond1 = vix > p65
-    uvix_cond2 = (pd.notna(ratio) and ratio > cfg.ratio_alert and ratio_up)
-    uvix_cond3 = (
-        pd.notna(row.get("vixy_ma_3"))
-        and pd.notna(row.get("vixy_ma_10"))
-        and (row.get("vixy_ma_3") > row.get("vixy_ma_10"))
-    )
-    uvix_cond4 = (pd.notna(spy_ret) and float(spy_ret) < -0.008)
+    # =========================================================
+    # ✅ A3: UVIX solo “pánico real” (quirúrgico)
+    # =========================================================
+    # Requisitos duros:
+    # - VIX en cola alta (p85)
+    # - SPY cae fuerte (stress de mercado)
+    # - proxy vol (VXX) en stress (MA3 > MA10)
+    # - ratio VXN/VIX en alerta y subiendo (stress tech relativo)
+    vixy_ma3 = row.get("vixy_ma_3")
+    vixy_ma10 = row.get("vixy_ma_10")
+    vxx_stress = (pd.notna(vixy_ma3) and pd.notna(vixy_ma10) and (float(vixy_ma3) > float(vixy_ma10)))
+    spy_stress = (pd.notna(spy_ret) and float(spy_ret) < -0.012)  # < -1.2%
+    ratio_stress = (pd.notna(ratio) and float(ratio) > cfg.ratio_alert and ratio_up)
 
-    uvix_score = sum([bool(uvix_cond1), bool(uvix_cond2), bool(uvix_cond3), bool(uvix_cond4)])
-
-    # ✅ UVIX "solo pánico real"
-    spy_panic = (pd.notna(spy_ret) and float(spy_ret) <= float(cfg.uvix_spy_panic_thresh))
-    vix_extremo = True
-    if cfg.uvix_require_vix_extreme:
-        vix_extremo = (pd.notna(vix) and pd.notna(p85) and float(vix) > float(p85))
-
-    if (uvix_score >= int(cfg.uvix_min_score)) and vix_extremo and spy_panic:
+    cond_uvix_panic = (vix > p85) and spy_stress and vxx_stress and ratio_stress
+    if cond_uvix_panic:
         return {
             "estado": "UVIX",
             "accion": "OPEN/HOLD UVIX",
-            "comentario": f"PANIC UVIX: score={uvix_score}, vix>p85 y spy_ret<={cfg.uvix_spy_panic_thresh*100:.1f}%.",
+            "comentario": "UVIX: pánico real (VIX>p85 + SPY caída fuerte + VXX stress + ratio VXN/VIX alerta y subiendo).",
         }
 
-    # PREP_SVIX
+    # PREP_SVIX (pánico se agota)
     cond_prep = (vix > p85) and (ratio_up is False) and contango_ok
     if cond_prep:
         return {"estado": "PREP_SVIX", "accion": "WAIT / PREPARE SVIX", "comentario": "Pánico se agota + contango vuelve."}
@@ -492,12 +431,6 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
 
 
 def compute_states(df_feat: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
-    """
-    Devuelve RAW:
-      - raw_estado / raw_accion / raw_comentario
-    y luego aplica filtros A+B+C para producir:
-      - estado / accion / comentario (operable)
-    """
     w = df_feat.copy()
 
     macro = fetch_macro_events()
@@ -505,136 +438,16 @@ def compute_states(df_feat: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.Da
         lambda d: macro_tomorrow_flag(pd.to_datetime(d), macro) if pd.notna(d) else False
     )
 
-    raw_estados, raw_acciones, raw_comentarios = [], [], []
+    estados, acciones, comentarios = [], [], []
     for _, r in w.iterrows():
         res = decide_state_row(r, cfg=cfg)
-        raw_estados.append(res["estado"])
-        raw_acciones.append(res["accion"])
-        raw_comentarios.append(res["comentario"])
+        estados.append(res["estado"])
+        acciones.append(res["accion"])
+        comentarios.append(res["comentario"])
 
-    w["raw_estado"] = raw_estados
-    w["raw_accion"] = raw_acciones
-    w["raw_comentario"] = raw_comentarios
-
-    # Aplicamos A+B+C
-    w = apply_signal_filters(w, cfg=cfg)
-
-    return w
-
-
-# -----------------------------
-# A + B + C: filtros anti-ruido
-# -----------------------------
-
-def _desired_state_from_raw(raw_estado: str) -> str:
-    # Mantenemos como "régimen operable" SVIX / UVIX / NEUTRAL
-    if raw_estado in ("SVIX", "UVIX"):
-        return raw_estado
-    return "NEUTRAL"
-
-
-def apply_signal_filters(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
-    """
-    Implementa:
-      A) Confirmación (confirm_days)
-      B) Cooldown (cooldown_days)
-      C) Anti-flip SVIX<->UVIX (anti_flip)
-    Output:
-      - estado / accion / comentario (final)
-    """
-    w = df.copy()
-    if w.empty:
-        w["estado"] = pd.NA
-        w["accion"] = pd.NA
-        w["comentario"] = pd.NA
-        return w
-
-    # ordenar por fecha por seguridad
-    if "date" in w.columns:
-        w = w.sort_values("date").reset_index(drop=True)
-
-    confirm_n = max(1, int(cfg.confirm_days))
-    cooldown_n = max(0, int(cfg.cooldown_days))
-
-    final_estado: List[str] = []
-    final_accion: List[str] = []
-    final_com: List[str] = []
-
-    current_state = "NEUTRAL"
-    last_change_idx = -10**9  # índice del último cambio real
-
-    # tracking para confirmación
-    run_state = None
-    run_len = 0
-
-    for i, row in w.iterrows():
-        raw_state = str(row.get("raw_estado", "NEUTRAL") or "NEUTRAL")
-        desired = _desired_state_from_raw(raw_state)
-
-        # --- Confirmación (A) ---
-        if desired == run_state:
-            run_len += 1
-        else:
-            run_state = desired
-            run_len = 1
-
-        confirmed_desired = desired if run_len >= confirm_n else current_state
-
-        # --- Anti-flip (C) ---
-        if cfg.anti_flip:
-            if (current_state in ("SVIX", "UVIX")) and (confirmed_desired in ("SVIX", "UVIX")) and (confirmed_desired != current_state):
-                # obligamos a pasar por NEUTRAL
-                confirmed_desired = "NEUTRAL"
-
-        # --- Cooldown (B) ---
-        if cooldown_n > 0:
-            in_cooldown = (i - last_change_idx) < cooldown_n
-            # en cooldown, no permitimos cambios de estado
-            if in_cooldown and confirmed_desired != current_state:
-                confirmed_desired = current_state
-
-        # aplicamos cambio si procede
-        changed = (confirmed_desired != current_state)
-        if changed:
-            last_change_idx = i
-            current_state = confirmed_desired
-
-        # construimos acción/comentario finales
-        if current_state == "SVIX":
-            accion = "OPEN/HOLD SVIX"
-        elif current_state == "UVIX":
-            accion = "OPEN/HOLD UVIX"
-        else:
-            accion = "NO NEW POSITION"
-
-        # comentario final: explicamos filtros si han intervenido
-        raw_acc = str(row.get("raw_accion", "") or "")
-        raw_coment = str(row.get("raw_comentario", "") or "")
-
-        note_parts = []
-        if confirm_n > 1:
-            note_parts.append(f"confirm={confirm_n}")
-        if cooldown_n > 0:
-            note_parts.append(f"cooldown={cooldown_n}")
-        if cfg.anti_flip:
-            note_parts.append("anti_flip=on")
-
-        filt_note = (" | ".join(note_parts)).strip()
-
-        if current_state == _desired_state_from_raw(raw_state):
-            # señal raw y final coinciden
-            comentario = raw_coment
-        else:
-            # filtros han modulado la señal
-            comentario = f"[FILTRADA] raw={raw_state} ({raw_acc}). {raw_coment} | {filt_note}"
-
-        final_estado.append(current_state)
-        final_accion.append(accion)
-        final_com.append(comentario)
-
-    w["estado"] = final_estado
-    w["accion"] = final_accion
-    w["comentario"] = final_com
+    w["estado"] = estados
+    w["accion"] = acciones
+    w["comentario"] = comentarios
     return w
 
 
@@ -658,25 +471,18 @@ def upsert_vix_daily(df: pd.DataFrame) -> int:
         "vixy_ma_3", "vixy_ma_10",
         "contango_ok",
         "macro_tomorrow",
-
-        # FINAL
         "estado", "accion", "comentario",
-
-        # RAW (si existen en tu schema; si no, el upsert hará fallback y las quitará)
-        "raw_estado", "raw_accion", "raw_comentario",
-
-        # OHLC operables
         "svix_open", "svix_high", "svix_low", "svix_close",
         "uvix_open", "uvix_high", "uvix_low", "uvix_close",
     ]
-
     w = w[[c for c in keep_cols if c in w.columns]].copy()
 
     records: List[Dict[str, Any]] = w.to_dict(orient="records")
     records = _json_sanitize_records(records)
 
-    # ✅ upsert con fallback si hay columnas que tu schema cache no conoce
-    _upsert_with_schema_fallback(table="vix_daily", records=records, on_conflict="fecha")
+    resp = supabase.table("vix_daily").upsert(records, on_conflict="fecha").execute()
+    if getattr(resp, "error", None):
+        raise RuntimeError(resp.error)
 
     return len(records)
 
