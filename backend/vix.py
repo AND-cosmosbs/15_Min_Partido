@@ -25,6 +25,9 @@ class VixConfig:
     use_guardrail: bool = True
     guardrail_vix_floor: float = 12.5  # si VIX < 12.5 => no abrir SVIX
 
+    # A3: UVIX pánico real (ajustable)
+    uvix_spy_panic_ret: float = -0.012  # -1.2% día SPY
+
 
 DEFAULT_CFG = VixConfig()
 
@@ -99,7 +102,6 @@ def _series1d(x: Any) -> pd.Series:
         return x
     if isinstance(x, pd.DataFrame):
         return x.iloc[:, 0]
-    # último recurso
     return pd.Series(x)
 
 
@@ -110,18 +112,15 @@ def _json_sanitize_value(x: Any) -> Any:
     if pd.isna(x):
         return None
 
-    # pandas Timestamp
     if isinstance(x, pd.Timestamp):
         return x.date().isoformat()
 
-    # datetime/date de python
     if hasattr(x, "isoformat") and ("date" in str(type(x)).lower() or "datetime" in str(type(x)).lower()):
         try:
             return x.isoformat()
         except Exception:
             return str(x)
 
-    # numpy scalars
     if isinstance(x, (np.integer,)):
         return int(x)
     if isinstance(x, (np.floating,)):
@@ -170,7 +169,6 @@ def _supabase_select_all(
 
         out.extend(data)
 
-        # Si devolvió menos de batch_size, ya no hay más.
         if len(data) < batch_size:
             break
 
@@ -223,7 +221,7 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
     tickers = {
         "^VIX": "vix",
         "^VXN": "vxn",
-        "VXX": "vixy",   # OJO: guardamos VXX en columna vixy (para no tocar schema)
+        "VXX": "vixy",   # guardamos VXX en vixy (schema estable)
         "SPY": "spy",
     }
 
@@ -264,7 +262,7 @@ def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
 
 def download_trade_ohlc(start: str, end: str) -> pd.DataFrame:
     """
-    Descarga OHLC de los tickers operables (SVIX, UVIX) para backtest de stops intradía.
+    Descarga OHLC de SVIX y UVIX.
     Devuelve: date, svix_open/high/low/close, uvix_open/high/low/close
     """
     import yfinance as yf
@@ -282,7 +280,7 @@ def download_trade_ohlc(start: str, end: str) -> pd.DataFrame:
             start=start,
             end=end,
             interval="1d",
-            auto_adjust=False,  # OHLC real
+            auto_adjust=False,
             progress=False,
             group_by="column",
             actions=False,
@@ -333,10 +331,8 @@ def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataF
     w["vixy"] = _safe_num_series(w["vixy"])
     w["spy"] = _safe_num_series(w["spy"])
 
-    # retorno SPY
     w["spy_ret"] = w["spy"].pct_change()
 
-    # ratio VXN/VIX + dirección
     w["vxn_vix_ratio"] = w["vxn"] / w["vix"]
     w["ratio_up"] = w["vxn_vix_ratio"].diff() > 0
 
@@ -347,7 +343,6 @@ def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataF
     w["vix_p65"] = w["vix"].rolling(lb).quantile(0.65)
     w["vix_p85"] = w["vix"].rolling(lb).quantile(0.85)
 
-    # MA sobre vixy (que ahora contiene VXX como proxy)
     w["vixy_ma_3"] = w["vixy"].rolling(3).mean()
     w["vixy_ma_10"] = w["vixy"].rolling(10).mean()
 
@@ -368,11 +363,9 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
     spy_ret = row.get("spy_ret")
     macro_tomorrow = bool(row.get("macro_tomorrow")) if pd.notna(row.get("macro_tomorrow")) else False
 
-    # Sin percentiles aún => no operar
-    if pd.isna(p10) or pd.isna(p25) or pd.isna(p65) or pd.isna(p85) or pd.isna(vix):
+    if pd.isna(p25) or pd.isna(p65) or pd.isna(p85) or pd.isna(vix):
         return {"estado": "NEUTRAL", "accion": "NO DATA", "comentario": "Insuficiente histórico para rolling 252."}
 
-    # Guardarraíl VIX demasiado bajo
     if cfg.use_guardrail and pd.notna(vix) and float(vix) < float(cfg.guardrail_vix_floor):
         return {
             "estado": "NEUTRAL",
@@ -380,50 +373,50 @@ def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, 
             "comentario": "Guardarraíl: VIX extremadamente bajo (riesgo snapback).",
         }
 
-    # =========================================================
-    # ✅ A1 + A2: SVIX solo en calma EXTREMA (p10) + SPY filtro
-    # =========================================================
-    # A2: evitamos abrir/seguir SVIX si SPY cae fuerte hoy (riesgo de latigazo)
-    spy_ok_for_svix = (pd.notna(spy_ret) and float(spy_ret) > -0.004)  # > -0.4%
+    # ---------------------------------------------------------
+    # SVIX (A1: más selectivo => p10 si existe, si no p25)
+    # + A2: filtro SPY (no abrir SVIX si SPY cae fuerte)
+    # ---------------------------------------------------------
+    svix_thr = p10 if pd.notna(p10) else p25
+    spy_filter_ok = True
+    if pd.notna(spy_ret):
+        spy_filter_ok = float(spy_ret) > -0.007  # -0.7% => evitamos abrir SVIX en día feo
 
     cond_svix = (
-        (vix < p10)  # A1: p10 (antes p25)
+        (pd.notna(vix) and pd.notna(svix_thr) and (vix < svix_thr))
         and (pd.notna(ratio) and ratio < cfg.ratio_ok)
         and contango_ok
         and (macro_tomorrow is False)
-        and spy_ok_for_svix  # A2
+        and spy_filter_ok
     )
     if cond_svix:
-        return {
-            "estado": "SVIX",
-            "accion": "OPEN/HOLD SVIX",
-            "comentario": "SVIX: calma extrema (VIX < p10) + contango + ratio OK + SPY no cae fuerte + sin macro mañana.",
-        }
+        return {"estado": "SVIX", "accion": "OPEN/HOLD SVIX", "comentario": "Calma extrema + contango + SPY ok + sin macro mañana."}
 
-    # =========================================================
-    # ✅ A3: UVIX solo “pánico real” (quirúrgico)
-    # =========================================================
-    # Requisitos duros:
-    # - VIX en cola alta (p85)
-    # - SPY cae fuerte (stress de mercado)
-    # - proxy vol (VXX) en stress (MA3 > MA10)
-    # - ratio VXN/VIX en alerta y subiendo (stress tech relativo)
-    vixy_ma3 = row.get("vixy_ma_3")
-    vixy_ma10 = row.get("vixy_ma_10")
-    vxx_stress = (pd.notna(vixy_ma3) and pd.notna(vixy_ma10) and (float(vixy_ma3) > float(vixy_ma10)))
-    spy_stress = (pd.notna(spy_ret) and float(spy_ret) < -0.012)  # < -1.2%
-    ratio_stress = (pd.notna(ratio) and float(ratio) > cfg.ratio_alert and ratio_up)
+    # ---------------------------------------------------------
+    # UVIX (A3: pánico real pero NO imposible)
+    # Requisito base: VIX > p85
+    # Y además 2 de 3:
+    #   1) ratio alto y subiendo
+    #   2) estructura tensa (MA3 > MA10)
+    #   3) SPY caída fuerte (por defecto -1.2%)
+    # ---------------------------------------------------------
+    uvix_base = (pd.notna(vix) and pd.notna(p85) and (vix > p85))
 
-    cond_uvix_panic = (vix > p85) and spy_stress and vxx_stress and ratio_stress
-    if cond_uvix_panic:
-        return {
-            "estado": "UVIX",
-            "accion": "OPEN/HOLD UVIX",
-            "comentario": "UVIX: pánico real (VIX>p85 + SPY caída fuerte + VXX stress + ratio VXN/VIX alerta y subiendo).",
-        }
+    uvix_cond_ratio = (pd.notna(ratio) and float(ratio) > float(cfg.ratio_alert) and ratio_up)
+    uvix_cond_struct = (
+        pd.notna(row.get("vixy_ma_3"))
+        and pd.notna(row.get("vixy_ma_10"))
+        and (float(row.get("vixy_ma_3")) > float(row.get("vixy_ma_10")))
+    )
+    uvix_cond_spy = (pd.notna(spy_ret) and float(spy_ret) < float(cfg.uvix_spy_panic_ret))
 
-    # PREP_SVIX (pánico se agota)
-    cond_prep = (vix > p85) and (ratio_up is False) and contango_ok
+    uvix_score = sum([bool(uvix_cond_ratio), bool(uvix_cond_struct), bool(uvix_cond_spy)])
+
+    if uvix_base and uvix_score >= 2:
+        return {"estado": "UVIX", "accion": "OPEN/HOLD UVIX", "comentario": f"Pánico real (VIX>p85) score={uvix_score}/3."}
+
+    # PREP_SVIX
+    cond_prep = (pd.notna(vix) and pd.notna(p85) and (vix > p85)) and (ratio_up is False) and contango_ok
     if cond_prep:
         return {"estado": "PREP_SVIX", "accion": "WAIT / PREPARE SVIX", "comentario": "Pánico se agota + contango vuelve."}
 
@@ -488,7 +481,6 @@ def upsert_vix_daily(df: pd.DataFrame) -> int:
 
 
 def fetch_vix_daily() -> pd.DataFrame:
-    # ✅ IMPORTANTE: paginamos para no quedarnos en 1000 filas
     data = _supabase_select_all(table="vix_daily", order_col="fecha", asc=True, batch_size=1000)
     df = pd.DataFrame(data)
     if not df.empty and "fecha" in df.columns:
@@ -501,7 +493,6 @@ def fetch_vix_daily() -> pd.DataFrame:
 # -----------------------------
 
 def fetch_vix_orders(limit: int = 300) -> pd.DataFrame:
-    # Si pides pocas (limit), usamos el endpoint normal.
     if limit <= 1000:
         resp = supabase.table("vix_orders").select("*").order("fecha", desc=True).limit(limit).execute()
         if getattr(resp, "error", None):
@@ -512,7 +503,6 @@ def fetch_vix_orders(limit: int = 300) -> pd.DataFrame:
             df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
         return df
 
-    # Si algún día quieres más de 1000, también paginamos:
     data = _supabase_select_all(table="vix_orders", order_col="fecha", asc=False, batch_size=1000)
     df = pd.DataFrame(data)
     if not df.empty and "fecha" in df.columns:
@@ -580,7 +570,6 @@ def run_vix_pipeline(start: str, end: str, cfg: VixConfig = DEFAULT_CFG) -> pd.D
     feat = compute_features(raw, cfg=cfg)
     out = compute_states(feat, cfg=cfg)
 
-    # merge OHLC operables (SVIX/UVIX)
     ohlc = download_trade_ohlc(start=start, end=end)
     if ohlc is not None and not ohlc.empty:
         out = out.merge(ohlc, on="date", how="left")
