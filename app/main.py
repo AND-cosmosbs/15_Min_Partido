@@ -3,6 +3,8 @@
 import os
 import sys
 import io
+import traceback
+
 import pandas as pd
 import streamlit as st
 
@@ -40,15 +42,17 @@ from backend.vix import (  # type: ignore
 
 # ✅ Motor de trading VIX (posiciones) — import seguro (no rompe la app si falta)
 VIX_TRADING_AVAILABLE = True
+VIX_TRADING_IMPORT_ERROR = None
 try:
     from backend.vix_trading import (  # type: ignore
         run_vix_execution,
         fetch_vix_positions,
     )
-except Exception:
+except Exception as e:
     VIX_TRADING_AVAILABLE = False
     run_vix_execution = None  # type: ignore
     fetch_vix_positions = None  # type: ignore
+    VIX_TRADING_IMPORT_ERROR = "".join(traceback.format_exception(type(e), e, e.__traceback__))
 
 
 # ---------- CARGA HISTÓRICO (CACHEADO) ----------
@@ -66,7 +70,7 @@ def _fetch_vix_daily_cached():
 
 
 # ======================================================================
-# HELPERS (Excel / ROI / RAROC / BANCA)
+# HELPERS (ROI / RAROC / BANCA)
 # ======================================================================
 
 def _safe_numeric(df: pd.DataFrame, col: str) -> None:
@@ -81,52 +85,6 @@ def _safe_int_default(value, default: int = 0) -> int:
         return int(float(value))
     except Exception:
         return default
-
-
-def _excel_make_tz_naive_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Excel NO soporta datetimes con timezone.
-    Este helper convierte cualquier columna datetime tz-aware a tz-naive.
-    También intenta sanear columnas object que contengan datetimes tz-aware.
-    """
-    out = df.copy()
-
-    # 1) Columnas datetime64 con tz (dtype)
-    try:
-        from pandas.api.types import is_datetime64tz_dtype
-        for c in list(out.columns):
-            if is_datetime64tz_dtype(out[c]):
-                out[c] = pd.to_datetime(out[c], errors="coerce").dt.tz_localize(None)
-    except Exception:
-        # Si por lo que sea falla el import, seguimos con el fallback de abajo
-        pass
-
-    # 2) Fallback para columnas object con timestamps tz-aware dentro
-    for c in list(out.columns):
-        if out[c].dtype == "object":
-            # Solo actuamos si detectamos algún tz-aware
-            sample = out[c].dropna().head(25).tolist()
-            has_tz = False
-            for v in sample:
-                try:
-                    # pandas.Timestamp con tz
-                    if isinstance(v, pd.Timestamp) and v.tz is not None:
-                        has_tz = True
-                        break
-                    # datetime python con tzinfo
-                    if hasattr(v, "tzinfo") and v.tzinfo is not None:
-                        has_tz = True
-                        break
-                except Exception:
-                    continue
-
-            if has_tz:
-                # Convertimos a datetime y quitamos tz
-                s = pd.to_datetime(out[c], errors="coerce", utc=True)
-                # utc=True -> tz-aware; lo dejamos tz-naive
-                out[c] = s.dt.tz_localize(None)
-
-    return out
 
 
 def _compute_total_stake(df: pd.DataFrame) -> pd.Series:
@@ -237,6 +195,48 @@ def _compute_equity_curve(
     cal.loc[ok, "drawdown_pct"] = cal.loc[ok, "drawdown_abs"] / cal.loc[ok, "peak"]
 
     return cal
+
+
+def _excel_safe_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Excel NO soporta datetimes con timezone.
+    Convierte cualquier datetime tz-aware a naive (sin tz).
+    """
+    out = df.copy()
+
+    # Columnas datetime tz-aware
+    try:
+        tz_cols = out.select_dtypes(include=["datetimetz"]).columns.tolist()
+        for c in tz_cols:
+            out[c] = pd.to_datetime(out[c], errors="coerce").dt.tz_localize(None)
+    except Exception:
+        pass
+
+    # Columnas object que podrían contener Timestamp con tz
+    for c in out.columns:
+        if out[c].dtype == "object":
+            # intentamos detectar si hay timestamps tz-aware
+            sample = out[c].dropna().head(20).tolist()
+            has_tz = False
+            for v in sample:
+                try:
+                    if isinstance(v, pd.Timestamp) and v.tzinfo is not None:
+                        has_tz = True
+                        break
+                except Exception:
+                    pass
+            if has_tz:
+                out[c] = pd.to_datetime(out[c], errors="coerce")
+                try:
+                    out[c] = out[c].dt.tz_localize(None)
+                except Exception:
+                    # si viene tz-aware real
+                    try:
+                        out[c] = out[c].dt.tz_convert(None)
+                    except Exception:
+                        pass
+
+    return out
 
 
 # ======================================================================
@@ -611,677 +611,4 @@ def show_stats():
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Total profit (€)", f"{total_profit:,.2f}")
-    with col2:
-        st.metric("Total stake (€)", f"{total_stake_sum:,.2f}")
-    with col3:
-        st.metric("ROI global", f"{roi_global*100:.2f}%" if roi_global is not None else "—")
-
-    st.markdown("---")
-    st.markdown("### VIX y ROI (cruce por régimen)")
-
-    try:
-        vix_daily = _fetch_vix_daily_cached()
-    except Exception as e:
-        vix_daily = pd.DataFrame()
-        st.warning(f"No se pudo leer vix_daily para cruzar con ROI: {e}")
-
-    if not vix_daily.empty and "fecha" in vix_daily.columns:
-        v = vix_daily.copy()
-        v["fecha"] = pd.to_datetime(v["fecha"], errors="coerce").dt.date
-        v = v.dropna(subset=["fecha"])
-
-        work = df.copy()
-        work["fecha_d"] = pd.to_datetime(work["fecha"], errors="coerce").dt.date
-
-        if "estado" in v.columns:
-            work = work.merge(
-                v[["fecha", "estado"]].rename(columns={"fecha": "fecha_d", "estado": "vix_estado"}),
-                on="fecha_d",
-                how="left",
-            )
-        else:
-            work["vix_estado"] = pd.NA
-
-        if work["vix_estado"].notna().any():
-            grp = (
-                work.groupby("vix_estado")
-                .apply(lambda g: pd.Series({
-                    "profit_total": g["profit_euros"].fillna(0).sum(),
-                    "stake_total": g["total_stake"].fillna(0).sum(),
-                    "n": len(g),
-                }))
-                .reset_index()
-            )
-            grp["roi_pct"] = grp.apply(
-                lambda r: (r["profit_total"] / r["stake_total"] * 100.0) if r["stake_total"] > 0 else 0.0,
-                axis=1,
-            )
-            grp = grp.sort_values("roi_pct", ascending=False)
-            st.markdown("#### ROI por régimen VIX (solo días con VIX)")
-            st.dataframe(grp, use_container_width=True)
-        else:
-            st.info("No hay cruce con régimen VIX todavía (faltan fechas o 'estado' en vix_daily).")
-    else:
-        st.info("Todavía no hay datos VIX suficientes para cruzar con ROI.")
-
-    st.markdown("---")
-    st.markdown("### Gráficos de ROI (en %)")
-
-    if "fecha" in df.columns and df["fecha"].notna().any():
-        df_time = df[df["fecha"].notna()].sort_values("fecha").copy()
-        df_time["profit_acum"] = df_time["profit_euros"].fillna(0).cumsum()
-        df_time["stake_acum"] = df_time["total_stake"].fillna(0).cumsum()
-
-        df_time["roi_acum_pct"] = pd.NA
-        ok = df_time["stake_acum"] > 0
-        df_time.loc[ok, "roi_acum_pct"] = (df_time.loc[ok, "profit_acum"] / df_time.loc[ok, "stake_acum"]) * 100.0
-
-        st.markdown("#### ROI acumulado en el tiempo (%)")
-        st.line_chart(df_time.set_index("fecha")[["roi_acum_pct"]], use_container_width=True)
-    else:
-        st.info("No hay fechas válidas para dibujar ROI acumulado.")
-
-    if "division" in df.columns:
-        st.markdown("#### ROI por división (barras, %)")
-        grp_div = (
-            df.groupby("division")
-            .apply(lambda g: pd.Series({
-                "profit_total": g["profit_euros"].fillna(0).sum(),
-                "stake_total": g["total_stake"].fillna(0).sum(),
-            }))
-            .reset_index()
-        )
-        grp_div["roi_pct"] = grp_div.apply(
-            lambda r: (r["profit_total"] / r["stake_total"] * 100.0) if r["stake_total"] > 0 else 0.0,
-            axis=1,
-        )
-        grp_div = grp_div.sort_values("roi_pct", ascending=False)
-        st.bar_chart(grp_div.set_index("division")[["roi_pct"]], use_container_width=True)
-
-
-# ======================================================================
-# VISTA: SUPERVIVENCIA & CONVEXIDAD (recuperada)
-# ======================================================================
-def show_supervivencia_convexidad():
-    st.markdown("### Supervivencia & Convexidad – Minuto del primer gol (HT)")
-
-    try:
-        df = fetch_seguimiento()
-    except Exception as e:
-        st.error(f"Error cargando datos de seguimiento: {e}")
-        return
-
-    if df.empty:
-        st.info("Todavía no hay datos en 'seguimiento'.")
-        return
-
-    if "fecha" in df.columns:
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-
-    if "minuto_primer_gol" not in df.columns:
-        st.warning("La tabla 'seguimiento' no tiene la columna 'minuto_primer_gol'.")
-        return
-
-    df["minuto_primer_gol"] = pd.to_numeric(df["minuto_primer_gol"], errors="coerce")
-
-    with st.expander("Filtros"):
-        if "fecha" in df.columns and df["fecha"].notna().any():
-            min_date = df["fecha"].min().date()
-            max_date = df["fecha"].max().date()
-            fecha_desde, fecha_hasta = st.date_input("Rango de fechas", value=(min_date, max_date))
-        else:
-            fecha_desde, fecha_hasta = None, None
-
-        divisiones = sorted([x for x in df.get("division", pd.Series()).dropna().unique()])
-        div_filter = st.multiselect("Filtrar por división", options=divisiones, default=divisiones) if divisiones else []
-
-        pick_types = sorted([x for x in df.get("pick_type", pd.Series()).dropna().unique()])
-        pick_filter = st.multiselect("Filtrar por PickType", options=pick_types, default=pick_types) if pick_types else []
-
-        if "apuesta_real" in df.columns:
-            ar_values = sorted([x for x in df["apuesta_real"].dropna().unique()])
-            apuesta_real_filter = st.multiselect("Filtrar por apuesta_real (SI/NO)", options=ar_values, default=ar_values) if ar_values else []
-        else:
-            apuesta_real_filter = []
-
-        if "estrategia" in df.columns:
-            est_values = sorted([x for x in df["estrategia"].dropna().unique()])
-            estrategia_filter = st.multiselect("Filtrar por estrategia", options=est_values, default=est_values) if est_values else []
-        else:
-            estrategia_filter = []
-
-    mask = pd.Series(True, index=df.index)
-    if fecha_desde is not None and "fecha" in df.columns:
-        mask &= df["fecha"].dt.date >= fecha_desde
-    if fecha_hasta is not None and "fecha" in df.columns:
-        mask &= df["fecha"].dt.date <= fecha_hasta
-    if div_filter:
-        mask &= df["division"].isin(div_filter)
-    if pick_filter:
-        mask &= df["pick_type"].isin(pick_filter)
-    if apuesta_real_filter and "apuesta_real" in df.columns:
-        mask &= df["apuesta_real"].isin(apuesta_real_filter)
-    if estrategia_filter and "estrategia" in df.columns:
-        mask &= df["estrategia"].isin(estrategia_filter)
-
-    df_filt = df[mask].copy()
-    if df_filt.empty:
-        st.warning("No hay registros que cumplan los filtros.")
-        return
-
-    st.write(f"Partidos considerados: **{len(df_filt)}**")
-
-    minutos = df_filt["minuto_primer_gol"].copy()
-    sin_gol_mask = minutos.isna()
-    total = len(df_filt)
-
-    grid = list(range(0, 46))
-    supervivencia = []
-    for m in grid:
-        vivos = ((minutos > m) | sin_gol_mask).sum()
-        supervivencia.append(vivos / total if total > 0 else 0.0)
-
-    surv_df = pd.DataFrame({"minuto": grid, "supervivencia": supervivencia})
-
-    st.markdown("#### Curva de supervivencia (P[sin gol hasta minuto m], 1ª parte)")
-    st.line_chart(surv_df.set_index("minuto")[["supervivencia"]], use_container_width=True)
-
-    st.markdown("#### Distribución del minuto del primer gol (bloques de 5 minutos)")
-    con_gol = df_filt[df_filt["minuto_primer_gol"].notna()].copy()
-    con_gol = con_gol[con_gol["minuto_primer_gol"] <= 45]
-
-    if con_gol.empty:
-        st.info("No hay goles registrados en 1ª parte (o están fuera de 0–45).")
-    else:
-        bins = list(range(0, 50, 5))
-        labels = [f"{bins[i]}–{bins[i+1]}" for i in range(len(bins) - 1)]
-        con_gol["bloque_5m"] = pd.cut(
-            con_gol["minuto_primer_gol"],
-            bins=bins,
-            labels=labels,
-            include_lowest=True,
-            right=True,
-        )
-
-        distrib_df = con_gol.groupby("bloque_5m").size().reset_index(name="n_partidos")
-        distrib_df["bloque_5m"] = distrib_df["bloque_5m"].astype(str)
-
-        n_sin_gol = df_filt["minuto_primer_gol"].isna().sum()
-        if n_sin_gol > 0:
-            distrib_df = pd.concat(
-                [distrib_df, pd.DataFrame({"bloque_5m": ["sin gol HT"], "n_partidos": [n_sin_gol]})],
-                ignore_index=True,
-            )
-
-        st.bar_chart(distrib_df.set_index("bloque_5m")[["n_partidos"]], use_container_width=True)
-
-    st.markdown("#### Percentiles del minuto del primer gol (HT)")
-    serie_goles = df_filt["minuto_primer_gol"].dropna()
-    serie_goles = serie_goles[serie_goles <= 45]
-
-    if serie_goles.empty:
-        st.info("No hay suficientes datos de minuto_primer_gol (0–45) para percentiles.")
-    else:
-        percentiles = {
-            "P10": float(serie_goles.quantile(0.10)),
-            "P25": float(serie_goles.quantile(0.25)),
-            "P50": float(serie_goles.quantile(0.50)),
-            "P75": float(serie_goles.quantile(0.75)),
-            "P90": float(serie_goles.quantile(0.90)),
-        }
-        pct_table = pd.DataFrame({"Percentil": list(percentiles.keys()), "Minuto": [round(v, 2) for v in percentiles.values()]})
-        st.table(pct_table)
-
-
-# ======================================================================
-# VISTA: BANCA (+ VIX)
-# ======================================================================
-def show_banca():
-    st.markdown("### Banca – equity, ROI sobre banca y Maximum Drawdown")
-
-    try:
-        mov = fetch_banca_movimientos()
-    except Exception as e:
-        st.error(f"Error cargando banca_movimientos: {e}")
-        return
-
-    try:
-        seg = fetch_seguimiento()
-    except Exception as e:
-        st.error(f"Error cargando seguimiento: {e}")
-        return
-
-    st.markdown("#### Añadir movimiento")
-    with st.form("form_banca_mov"):
-        c1, c2, c3 = st.columns([1, 1, 2])
-        with c1:
-            fecha = st.date_input("Fecha", value=pd.Timestamp.today().date())
-        with c2:
-            tipo = st.selectbox("Tipo", options=["DEPOSITO", "RETIRADA", "AJUSTE"])
-        with c3:
-            importe = st.number_input("Importe", value=0.0, step=10.0, format="%.2f")
-
-        comentario = st.text_input("Comentario (opcional)", value="")
-        submitted = st.form_submit_button("Guardar movimiento")
-
-        if submitted:
-            try:
-                insert_banca_movimiento(
-                    fecha=fecha,
-                    tipo=tipo,
-                    importe=float(importe),
-                    comentario=comentario if comentario.strip() else None,
-                )
-                st.success("Movimiento guardado.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error guardando movimiento: {e}")
-
-    st.markdown("---")
-
-    if mov.empty:
-        st.info("No hay movimientos todavía. Inserta al menos el **depósito inicial** para poder calcular la banca.")
-        return
-
-    st.markdown("#### Configuración")
-    only_real = st.checkbox("Usar solo apuestas reales (apuesta_real = SI) para el equity", value=True)
-
-    equity_df = _compute_equity_curve(movimientos_df=mov, seguimiento_df=seg, only_real=only_real)
-    if equity_df.empty:
-        st.info("No hay fechas suficientes (movimientos o profits con fecha).")
-        return
-
-    banca_inicial = float(equity_df.iloc[0]["equity"]) if len(equity_df) > 0 else 0.0
-    banca_actual = float(equity_df.iloc[-1]["equity"]) if len(equity_df) > 0 else 0.0
-
-    total_profit = float(equity_df.iloc[-1]["profit_cum"]) if "profit_cum" in equity_df.columns else 0.0
-    roi_banca = (total_profit / banca_inicial) if banca_inicial > 0 else None
-
-    mdd_pct = None
-    if "drawdown_pct" in equity_df.columns and equity_df["drawdown_pct"].notna().any():
-        mdd_pct = float(equity_df["drawdown_pct"].min())
-    mdd_abs = None
-    if "drawdown_abs" in equity_df.columns and equity_df["drawdown_abs"].notna().any():
-        mdd_abs = float(equity_df["drawdown_abs"].min())
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Banca inicial", f"{banca_inicial:,.2f} €")
-    c2.metric("Banca actual", f"{banca_actual:,.2f} €")
-    c3.metric("Profit acumulado (apuestas)", f"{total_profit:,.2f} €")
-    c4.metric("ROI sobre banca inicial", f"{roi_banca*100:.2f}%" if roi_banca is not None else "—")
-
-    st.markdown("#### Maximum Drawdown")
-    if mdd_pct is None:
-        st.info("No se puede calcular MDD.")
-    else:
-        st.metric("MDD %", f"{mdd_pct*100:.2f}%")
-        if mdd_abs is not None:
-            st.metric("MDD €", f"{mdd_abs:,.2f} €")
-
-    st.markdown("#### Evolución de banca (equity)")
-    plot = equity_df.copy()
-    plot["fecha"] = pd.to_datetime(plot["fecha"])
-    st.line_chart(plot.set_index("fecha")[["equity"]], use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("### Banca + VIX (tabla cruzada por fecha)")
-
-    try:
-        vix_daily = _fetch_vix_daily_cached()
-    except Exception as e:
-        vix_daily = pd.DataFrame()
-        st.warning(f"No se pudo leer vix_daily: {e}")
-
-    if not vix_daily.empty and "fecha" in vix_daily.columns:
-        v = vix_daily.copy()
-        v["fecha"] = pd.to_datetime(v["fecha"], errors="coerce").dt.date
-        v = v.dropna(subset=["fecha"])
-
-        e = equity_df.copy()
-        if "fecha" in e.columns:
-            e["fecha"] = pd.to_datetime(e["fecha"], errors="coerce").dt.date
-
-        cols_v = ["fecha"]
-        for c in ["estado", "accion", "comentario"]:
-            if c in v.columns:
-                cols_v.append(c)
-
-        merged = e.merge(v[cols_v], on="fecha", how="left")
-        st.dataframe(
-            merged.sort_values("fecha", ascending=False),
-            use_container_width=True
-        )
-    else:
-        st.info("No hay VIX suficiente para cruzar con la banca.")
-
-
-# ======================================================================
-# VISTA: VIX (robusta: vix_daily + órdenes + export + motor)
-# ======================================================================
-def show_vix():
-    st.markdown("### VIX – régimen diario (SVIX / NEUTRAL / UVIX)")
-
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        start = st.date_input("Start", value=pd.Timestamp("2025-01-01").date())
-    with c2:
-        end = st.date_input("End (exclusivo)", value=(pd.Timestamp.today().date() + pd.Timedelta(days=1)))
-
-    if st.button("Actualizar VIX (descargar + calcular + guardar en Supabase)"):
-        try:
-            run_vix_pipeline(start=str(start), end=str(end))
-            st.success("VIX actualizado y guardado en Supabase (vix_daily).")
-            st.rerun()
-        except Exception as e:
-            st.exception(e)
-
-    st.markdown("---")
-
-    try:
-        daily = fetch_vix_daily()
-    except Exception as e:
-        st.error(f"Error leyendo VIX desde Supabase: {e}")
-        return
-
-    if daily.empty:
-        st.info("No hay datos en vix_daily todavía.")
-        return
-
-    daily = daily.copy()
-    if "fecha" in daily.columns:
-        daily["fecha"] = pd.to_datetime(daily["fecha"], errors="coerce")
-        daily = daily.dropna(subset=["fecha"]).sort_values("fecha")
-    else:
-        st.error("vix_daily no tiene columna 'fecha'.")
-        return
-
-    last = daily.iloc[-1]
-
-    st.markdown("#### Señal del día (la importante)")
-    cA, cB, cC = st.columns(3)
-    cA.metric("Fecha", str(last.get("fecha").date()) if pd.notna(last.get("fecha")) else "—")
-    cB.metric("Estado", str(last.get("estado", "—")))
-    cC.metric("Acción", str(last.get("accion", "—")))
-    st.write(f"**Comentario:** {last.get('comentario', '')}")
-
-    st.markdown("---")
-
-    for col in ["vix", "vxn_vix_ratio", "vixy_ma_3", "vixy_ma_10", "spy_ret", "vixy"]:
-        _safe_numeric(daily, col)
-
-    st.markdown("#### Explicación rápida de los indicadores")
-    st.markdown(
-        """
-- **VXN/VIX**: compara “miedo Nasdaq” vs “miedo S&P”. Si sube y se dispara, suele indicar stress más “tech”.
-- **Contango proxy (MA3 vs MA10 de VXX guardado en `vixy`)**: si **MA3 > MA10** suele ser síntoma de tensión
-  (menos carry / estructura más tensa).
-- **SPY_ret**: retorno diario del S&P (proxy SPY). Un -0.8% o peor añade “stress” al score UVIX.
-        """.strip()
-    )
-
-    if "vix" in daily.columns:
-        st.markdown("#### VIX (spot)")
-        st.line_chart(daily.set_index("fecha")[["vix"]], use_container_width=True)
-
-    if "vxn_vix_ratio" in daily.columns:
-        st.markdown("#### Ratio VXN/VIX")
-        st.line_chart(daily.set_index("fecha")[["vxn_vix_ratio"]], use_container_width=True)
-
-    cont_cols = [c for c in ["vixy_ma_3", "vixy_ma_10"] if c in daily.columns]
-    if len(cont_cols) == 2:
-        st.markdown("#### Contango proxy (MA corta vs MA larga)")
-        st.line_chart(daily.set_index("fecha")[cont_cols], use_container_width=True)
-    else:
-        st.info("No hay columnas de medias móviles MA3/MA10 en vix_daily.")
-
-    st.markdown("#### Tabla (vix_daily)")
-    show_cols = [c for c in [
-        "fecha",
-        "estado", "accion", "comentario",
-        "vix", "vxn", "vixy", "spy",
-        "vxn_vix_ratio", "contango_ok", "macro_tomorrow",
-        "vix_p25", "vix_p65", "vix_p85",
-        "vixy_ma_3", "vixy_ma_10",
-        "spy_ret",
-        "svix_open", "svix_high", "svix_low", "svix_close",
-        "uvix_open", "uvix_high", "uvix_low", "uvix_close",
-    ] if c in daily.columns]
-    st.dataframe(daily[show_cols].sort_values("fecha", ascending=False), use_container_width=True)
-
-    # --------------------------
-    # EXPORT (Excel-friendly)
-    # --------------------------
-    st.markdown("---")
-    st.markdown("### Exportar vix_daily")
-
-    export_df = daily[show_cols].sort_values("fecha", ascending=True).copy()
-    if "fecha" in export_df.columns:
-        export_df["fecha"] = pd.to_datetime(export_df["fecha"], errors="coerce").dt.date
-
-    csv_bytes = export_df.to_csv(index=False, sep=";", encoding="utf-8").encode("utf-8")
-    st.download_button(
-        "⬇️ Descargar CSV (formato Excel-friendly ;)",
-        data=csv_bytes,
-        file_name="vix_daily_export.csv",
-        mime="text/csv",
-    )
-
-    try:
-        buffer = io.BytesIO()
-        export_df_xlsx = _excel_make_tz_naive_df(export_df)
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            export_df_xlsx.to_excel(writer, index=False, sheet_name="vix_daily")
-        st.download_button(
-            "⬇️ Descargar Excel (.xlsx)",
-            data=buffer.getvalue(),
-            file_name="vix_daily_export.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    except Exception as e:
-        st.warning(f"No se pudo generar Excel (.xlsx): {e}")
-
-    # --------------------------
-    # Órdenes VIX
-    # --------------------------
-    st.markdown("---")
-    st.markdown("### Órdenes VIX (entrada/salida)")
-
-    estado_hoy = str(last.get("estado", "NEUTRAL"))
-    accion_hoy = str(last.get("accion", ""))
-    comentario_hoy = str(last.get("comentario", ""))
-
-    with st.expander("➕ Crear orden", expanded=True):
-        c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1])
-        with c1:
-            fecha_ord = st.date_input(
-                "Fecha orden",
-                value=last.get("fecha").date() if pd.notna(last.get("fecha")) else pd.Timestamp.today().date()
-            )
-        with c2:
-            ticker = st.selectbox("Ticker", options=["SVIX", "UVIX"], index=0)
-        with c3:
-            side = st.selectbox("Side", options=["BUY", "SELL"], index=0)
-        with c4:
-            status = st.selectbox("Status", options=["PLANNED", "EXECUTED", "CANCELLED"], index=0)
-
-        c5, c6, c7 = st.columns([1, 1, 2])
-        with c5:
-            qty = st.number_input("Cantidad (qty)", min_value=0.0, value=1.0, step=1.0)
-        with c6:
-            price = st.number_input("Precio (opcional)", min_value=0.0, value=0.0, step=0.01)
-        with c7:
-            notes = st.text_input("Notas (opcional)", value=f"Auto: estado={estado_hoy} | accion={accion_hoy}")
-
-        if st.button("Guardar orden"):
-            try:
-                insert_vix_order(
-                    fecha=fecha_ord,
-                    ticker=ticker,
-                    side=side,
-                    qty=float(qty),
-                    price=(float(price) if float(price) > 0 else None),
-                    status=status,
-                    notes=notes if notes.strip() else None,
-                    estado_signal=estado_hoy,
-                )
-                st.success("Orden guardada en Supabase (vix_orders).")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error guardando orden: {e}")
-
-    try:
-        orders = fetch_vix_orders(limit=300)
-    except Exception as e:
-        st.error(f"Error leyendo vix_orders: {e}")
-        orders = pd.DataFrame()
-
-    if orders.empty:
-        st.info("No hay órdenes todavía.")
-    else:
-        st.markdown("#### Últimas órdenes")
-        show_cols_o = [c for c in ["id","fecha","estado_signal","ticker","side","qty","price","status","notes","created_at","updated_at"] if c in orders.columns]
-        st.dataframe(orders[show_cols_o], use_container_width=True)
-
-        st.markdown("#### Actualizar estado de una orden")
-        c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
-        with c1:
-            default_id = int(orders.iloc[0]["id"]) if ("id" in orders.columns and len(orders) > 0) else 1
-            order_id = st.number_input("Order ID", min_value=1, value=default_id, step=1)
-        with c2:
-            new_status = st.selectbox("Nuevo status", options=["PLANNED","EXECUTED","CANCELLED"], index=1)
-        with c3:
-            new_price = st.number_input("Precio ejecución (opcional)", min_value=0.0, value=0.0, step=0.01)
-        with c4:
-            new_notes = st.text_input("Notas actualización (opcional)", value="")
-
-        if st.button("Actualizar orden"):
-            try:
-                update_vix_order_status(
-                    order_id=int(order_id),
-                    status=new_status,
-                    price=(float(new_price) if float(new_price) > 0 else None),
-                    notes=(new_notes if new_notes.strip() else None),
-                )
-                st.success("Orden actualizada.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error actualizando orden: {e}")
-
-    # --------------------------
-    # MOTOR VIX (vix_trading.py)
-    # --------------------------
-    st.markdown("---")
-    st.markdown("## Motor VIX (posiciones + reglas)")
-
-    if not VIX_TRADING_AVAILABLE:
-        st.warning("El motor VIX no está disponible: no se pudo importar backend/vix_trading.py.")
-        return
-
-    st.markdown(
-        """
-Este motor calcula/actualiza la tabla **vix_positions** aplicando reglas operables
-(mínimo 48h, stops/TP1/trailing, anti-flip, etc. según tu vix_trading.py).
-        """.strip()
-    )
-
-    if st.button("▶️ Ejecutar motor VIX (actualizar posiciones)"):
-        try:
-            assert run_vix_execution is not None
-            run_vix_execution()
-            st.success("Motor ejecutado. Posiciones actualizadas en Supabase (vix_positions).")
-            st.rerun()
-        except Exception as e:
-            st.exception(e)
-
-    # Tabla posiciones
-    try:
-        assert fetch_vix_positions is not None
-        pos = fetch_vix_positions(limit=500)
-    except Exception as e:
-        st.error(f"Error leyendo vix_positions: {e}")
-        pos = pd.DataFrame()
-
-    if pos.empty:
-        st.info("No hay posiciones todavía en vix_positions.")
-    else:
-        st.markdown("### Posiciones (vix_positions)")
-        pos_view = pos.copy()
-
-        # Ordenamos si existe fecha_entry
-        if "fecha_entry" in pos_view.columns:
-            pos_view["fecha_entry"] = pd.to_datetime(pos_view["fecha_entry"], errors="coerce")
-            pos_view = pos_view.sort_values("fecha_entry", ascending=False)
-
-        if "fecha_exit" in pos_view.columns:
-            pos_view["fecha_exit"] = pd.to_datetime(pos_view["fecha_exit"], errors="coerce")
-
-        st.dataframe(pos_view, use_container_width=True)
-
-        st.markdown("### Exportar vix_positions")
-        export_pos = pos_view.copy()
-
-        # CSV “Excel España” => ; como separador
-        csv_pos = export_pos.to_csv(index=False, sep=";", encoding="utf-8").encode("utf-8")
-        st.download_button(
-            "⬇️ Descargar CSV posiciones (Excel-friendly ;)",
-            data=csv_pos,
-            file_name="vix_positions_export.csv",
-            mime="text/csv",
-        )
-
-        try:
-            buffer2 = io.BytesIO()
-            export_pos_xlsx = _excel_make_tz_naive_df(export_pos)
-            with pd.ExcelWriter(buffer2, engine="openpyxl") as writer:
-                export_pos_xlsx.to_excel(writer, index=False, sheet_name="vix_positions")
-            st.download_button(
-                "⬇️ Descargar Excel posiciones (.xlsx)",
-                data=buffer2.getvalue(),
-                file_name="vix_positions_export.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        except Exception as e:
-            st.warning(f"No se pudo generar Excel de posiciones: {e}")
-
-
-# ======================================================================
-# INTERFAZ PRINCIPAL
-# ======================================================================
-def main():
-    st.set_page_config(page_title="Selector de Partidos HT/FT", layout="wide")
-
-    st.sidebar.title("Navegación")
-    modo = st.sidebar.radio(
-        "Selecciona modo",
-        options=[
-            "Selector de partidos",
-            "Gestión de apuestas",
-            "Estadísticas ROI",
-            "Supervivencia & Convexidad",
-            "Banca",
-            "VIX",
-        ],
-    )
-
-    if modo == "Selector de partidos":
-        st.title("Selector de partidos HT/FT – Modelo")
-        show_selector()
-    elif modo == "Gestión de apuestas":
-        st.title("Gestión de apuestas – Seguimiento")
-        show_gestion()
-    elif modo == "Estadísticas ROI":
-        st.title("Estadísticas de ROI")
-        show_stats()
-    elif modo == "Supervivencia & Convexidad":
-        st.title("Supervivencia & Convexidad")
-        show_supervivencia_convexidad()
-    elif modo == "Banca":
-        st.title("Banca")
-        show_banca()
-    else:
-        st.title("VIX")
-        show_vix()
-
-
-if __name__ == "__main__":
-    main()
+    with col
