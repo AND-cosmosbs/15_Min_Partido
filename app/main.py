@@ -3,6 +3,7 @@
 import os
 import sys
 import io
+import traceback
 import pandas as pd
 import streamlit as st
 
@@ -40,15 +41,19 @@ from backend.vix import (  # type: ignore
 
 # ✅ Motor de trading VIX (posiciones) — import seguro (no rompe la app si falta)
 VIX_TRADING_AVAILABLE = True
+VIX_TRADING_IMPORT_ERROR = None
+
 try:
     from backend.vix_trading import (  # type: ignore
         run_vix_execution,
         fetch_vix_positions,
     )
-except Exception:
+except Exception as e:
     VIX_TRADING_AVAILABLE = False
     run_vix_execution = None  # type: ignore
     fetch_vix_positions = None  # type: ignore
+    # Guardamos el traceback completo para verlo en la UI
+    VIX_TRADING_IMPORT_ERROR = traceback.format_exc()
 
 
 # ---------- CARGA HISTÓRICO (CACHEADO) ----------
@@ -1175,6 +1180,9 @@ def show_vix():
 
     if not VIX_TRADING_AVAILABLE:
         st.warning("El motor VIX no está disponible: no se pudo importar backend/vix_trading.py.")
+        if VIX_TRADING_IMPORT_ERROR:
+            with st.expander("Ver detalle del error de import (traceback)"):
+                st.code(VIX_TRADING_IMPORT_ERROR, language="text")
         return
 
     st.markdown(
