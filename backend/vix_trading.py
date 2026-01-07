@@ -1,584 +1,442 @@
-# backend/vix.py
+# backend/vix_trading.py
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Iterable
+from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
 from .supabase_client import supabase
+from .vix import fetch_vix_daily  # usa tu tabla vix_daily ya calculada
 
 
-# -----------------------------
-# Config
-# -----------------------------
+# ============================================================
+# Config de ejecución / reglas
+# ============================================================
 
 @dataclass
-class VixConfig:
-    lookback_pct: int = 252
-    ratio_alert: float = 1.30
-    ratio_ok: float = 1.25
-
-    # Guardarraíl “VIX demasiado bajo”
-    use_guardrail: bool = True
-    guardrail_vix_floor: float = 12.5  # si VIX < 12.5 => no abrir SVIX
-
-
-DEFAULT_CFG = VixConfig()
+class TradeRules:
+    stop_pct: float
+    tp1_pct: float
+    trailing_pct: float
+    tp1_take: float = 0.50          # % de posición que se vende en TP1
+    min_hold_days: int = 2          # 48h ~ 2 sesiones
+    max_hold_days_no_tp1: int = 5   # time-stop si no hay TP1
+    min_gain_to_keep_after_maxhold: float = 0.02  # +2% mínimo si no hay TP1
 
 
-# -----------------------------
-# Utilidades robustas
-# -----------------------------
+# UVIX payoff-focused
+UVIX_RULES = TradeRules(
+    stop_pct=0.10,        # -10%
+    tp1_pct=0.10,         # +10%
+    trailing_pct=0.08,    # ✅ (payoff) deja respirar más para capturar explosiones
+    tp1_take=0.50,
+    min_hold_days=2,
+    max_hold_days_no_tp1=5,
+    min_gain_to_keep_after_maxhold=0.02,
+)
 
-def _safe_num_series(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce")
+# SVIX (no lo tocamos aquí; queda como estaba)
+SVIX_RULES = TradeRules(
+    stop_pct=0.04,
+    tp1_pct=0.06,
+    trailing_pct=0.04,
+    tp1_take=0.50,
+    min_hold_days=2,
+    max_hold_days_no_tp1=10,
+    min_gain_to_keep_after_maxhold=0.01,
+)
 
-
-def _normalize_date_index(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "date" in out.columns:
-        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
-        return out
-
-    if isinstance(out.index, (pd.DatetimeIndex,)):
-        out = out.reset_index()
-        if "Date" in out.columns:
-            out.rename(columns={"Date": "date"}, inplace=True)
-        elif "Datetime" in out.columns:
-            out.rename(columns={"Datetime": "date"}, inplace=True)
-        else:
-            out.rename(columns={out.columns[0]: "date"}, inplace=True)
-
-        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
-        return out
-
-    raise RuntimeError("No se pudo detectar columna/índice de fecha en la descarga de Yahoo.")
-
-
-def _pick_close_column(df: pd.DataFrame) -> pd.Series:
-    cols = list(df.columns)
-
-    if isinstance(df.columns, pd.MultiIndex):
-        # yfinance a veces devuelve MultiIndex
-        if ("Close" in df.columns.get_level_values(0)) or ("close" in df.columns.get_level_values(0)):
-            try:
-                s = df["Close"]
-                if isinstance(s, pd.DataFrame):
-                    s = s.iloc[:, 0]
-                return s
-            except Exception:
-                pass
-
-    for c in ["Close", "close", "Adj Close", "adjclose", "AdjClose"]:
-        if c in cols:
-            s = df[c]
-            if isinstance(s, pd.DataFrame):
-                s = s.iloc[:, 0]
-            return s
-
-    raise RuntimeError(f"No se encontró columna de cierre en Yahoo. Columnas: {cols}")
+RULES_BY_TICKER: Dict[str, TradeRules] = {
+    "UVIX": UVIX_RULES,
+    "SVIX": SVIX_RULES,
+}
 
 
-def _ensure_expected_columns(out: pd.DataFrame, expected: Iterable[str]) -> None:
-    missing = [c for c in expected if c not in out.columns]
-    if missing:
-        raise RuntimeError(
-            "Descarga/merge incompleto. Faltan columnas: "
-            f"{missing}. Columnas presentes: {list(out.columns)}"
-        )
-
-
-def _series1d(x: Any) -> pd.Series:
-    """
-    Convierte a Series 1D (por si yfinance devuelve DataFrame).
-    """
-    if isinstance(x, pd.Series):
-        return x
-    if isinstance(x, pd.DataFrame):
-        return x.iloc[:, 0]
-    # último recurso
-    return pd.Series(x)
-
+# ============================================================
+# Helpers
+# ============================================================
 
 def _json_sanitize_value(x: Any) -> Any:
     if x is None:
         return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
 
-    if pd.isna(x):
-        return None
-
-    # pandas Timestamp
     if isinstance(x, pd.Timestamp):
-        return x.date().isoformat()
+        if x.tzinfo is not None:
+            x = x.tz_convert(None)
+        return x.isoformat()
 
-    # datetime/date de python
-    if hasattr(x, "isoformat") and ("date" in str(type(x)).lower() or "datetime" in str(type(x)).lower()):
+    if hasattr(x, "isoformat"):
         try:
             return x.isoformat()
         except Exception:
             return str(x)
 
-    # numpy scalars
-    if isinstance(x, (np.integer,)):
-        return int(x)
-    if isinstance(x, (np.floating,)):
-        return float(x)
-    if isinstance(x, (np.bool_,)):
-        return bool(x)
+    try:
+        import numpy as np
+        if isinstance(x, (np.integer,)):
+            return int(x)
+        if isinstance(x, (np.floating,)):
+            return float(x)
+        if isinstance(x, (np.bool_,)):
+            return bool(x)
+    except Exception:
+        pass
 
     return x
 
 
-def _json_sanitize_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    clean: List[Dict[str, Any]] = []
-    for r in records:
-        clean.append({k: _json_sanitize_value(v) for k, v in r.items()})
-    return clean
+def _sanitize_payload(d: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: _json_sanitize_value(v) for k, v in d.items()}
 
 
-def _supabase_select_all(
-    table: str,
-    order_col: str,
-    asc: bool = True,
-    batch_size: int = 1000,
-) -> List[Dict[str, Any]]:
-    """
-    PostgREST/Supabase devuelve 1000 filas por defecto si no paginamos.
-    Esto descarga TODAS las filas por bloques.
-    """
-    out: List[Dict[str, Any]] = []
-    start = 0
-
-    while True:
-        end = start + batch_size - 1
-        resp = (
-            supabase.table(table)
-            .select("*")
-            .order(order_col, desc=(not asc))
-            .range(start, end)
-            .execute()
-        )
-        if getattr(resp, "error", None):
-            raise RuntimeError(resp.error)
-
-        data = getattr(resp, "data", None) or []
-        if not data:
-            break
-
-        out.extend(data)
-
-        # Si devolvió menos de batch_size, ya no hay más.
-        if len(data) < batch_size:
-            break
-
-        start += batch_size
-
-    return out
+def _to_date(x: Any) -> Optional[pd.Timestamp]:
+    if x is None:
+        return None
+    t = pd.to_datetime(x, errors="coerce")
+    if pd.isna(t):
+        return None
+    return t.normalize()
 
 
-# -----------------------------
-# Supabase: macro events
-# -----------------------------
+def _num(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+        if pd.isna(v):
+            return None
+        return v
+    except Exception:
+        return None
 
-def fetch_macro_events() -> pd.DataFrame:
-    resp = supabase.table("macro_events").select("*").execute()
+
+def _get_ohlc_for_ticker(
+    row: pd.Series,
+    ticker: str
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    t = (ticker or "").upper().strip()
+    prefix = "uvix" if t == "UVIX" else "svix"
+    o = _num(row.get(f"{prefix}_open"))
+    h = _num(row.get(f"{prefix}_high"))
+    l = _num(row.get(f"{prefix}_low"))
+    c = _num(row.get(f"{prefix}_close"))
+    return o, h, l, c
+
+
+# ============================================================
+# Supabase I/O: vix_positions
+# ============================================================
+
+def fetch_vix_positions(limit: int = 500) -> pd.DataFrame:
+    resp = (
+        supabase.table("vix_positions")
+        .select("*")
+        .order("entry_date", desc=True)
+        .limit(limit)
+        .execute()
+    )
     if getattr(resp, "error", None):
-        raise RuntimeError(f"Error leyendo macro_events: {resp.error}")
+        raise RuntimeError(resp.error)
 
     data = getattr(resp, "data", None) or []
     df = pd.DataFrame(data)
-    if df.empty:
-        return df
 
-    if "fecha" in df.columns:
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.date
-    if "activo" in df.columns:
-        df["activo"] = df["activo"].fillna(True)
+    for c in ["entry_signal_date", "entry_date", "exit_date", "created_at", "updated_at"]:
+        if c in df.columns and not df.empty:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+            try:
+                df[c] = df[c].dt.tz_localize(None)
+            except Exception:
+                pass
+
     return df
 
 
-def macro_tomorrow_flag(fecha: pd.Timestamp, macro_df: pd.DataFrame) -> bool:
-    if macro_df is None or macro_df.empty:
-        return False
-    tomorrow = (fecha + pd.Timedelta(days=1)).date()
-    w = macro_df.copy()
-    w = w[(w.get("activo", True) == True) & (w["fecha"] == tomorrow)]
-    return len(w) > 0
-
-
-# -----------------------------
-# Yahoo download (robusto)
-# -----------------------------
-
-def download_yahoo_daily(start: str, end: str) -> pd.DataFrame:
-    """
-    Descarga diaria de: ^VIX, ^VXN, proxy contango VXX (guardado en columna vixy), SPY
-    Devuelve columnas: date, vix, vxn, vixy, spy
-    """
-    import yfinance as yf
-
-    tickers = {
-        "^VIX": "vix",
-        "^VXN": "vxn",
-        "VXX": "vixy",   # OJO: guardamos VXX en columna vixy (para no tocar schema)
-        "SPY": "spy",
-    }
-
-    out: Optional[pd.DataFrame] = None
-
-    for tkr, col in tickers.items():
-        data = yf.download(
-            tkr,
-            start=start,
-            end=end,
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            group_by="column",
-            actions=False,
-        )
-
-        if data is None or data.empty:
-            raise RuntimeError(f"No hay datos para {tkr} en Yahoo en el rango {start}..{end}")
-
-        data = _normalize_date_index(data)
-        close = _pick_close_column(data)
-
-        df_one = pd.DataFrame({"date": data["date"], col: _series1d(close).values})
-        df_one["date"] = pd.to_datetime(df_one["date"], errors="coerce").dt.normalize()
-
-        if out is None:
-            out = df_one
-        else:
-            out = out.merge(df_one, on="date", how="outer")
-
-    assert out is not None
-    out = out.sort_values("date").reset_index(drop=True)
-
-    _ensure_expected_columns(out, ["date", "vix", "vxn", "vixy", "spy"])
-    return out
-
-
-def download_trade_ohlc(start: str, end: str) -> pd.DataFrame:
-    """
-    Descarga OHLC de los tickers operables (SVIX, UVIX) para backtest de stops intradía.
-    Devuelve: date, svix_open/high/low/close, uvix_open/high/low/close
-    """
-    import yfinance as yf
-
-    tickers = {
-        "SVIX": "svix",
-        "UVIX": "uvix",
-    }
-
-    out: Optional[pd.DataFrame] = None
-
-    for tkr, prefix in tickers.items():
-        data = yf.download(
-            tkr,
-            start=start,
-            end=end,
-            interval="1d",
-            auto_adjust=False,  # OHLC real
-            progress=False,
-            group_by="column",
-            actions=False,
-        )
-
-        if data is None or data.empty:
-            raise RuntimeError(f"No hay datos OHLC para {tkr} en Yahoo en el rango {start}..{end}")
-
-        data = _normalize_date_index(data)
-
-        for needed in ["Open", "High", "Low", "Close"]:
-            if needed not in data.columns:
-                raise RuntimeError(f"{tkr} no trae columna {needed}. Columnas: {list(data.columns)}")
-
-        o = _series1d(data["Open"])
-        h = _series1d(data["High"])
-        l = _series1d(data["Low"])
-        c = _series1d(data["Close"])
-
-        df_one = pd.DataFrame({
-            "date": pd.to_datetime(data["date"], errors="coerce").dt.normalize(),
-            f"{prefix}_open": pd.to_numeric(o, errors="coerce").values,
-            f"{prefix}_high": pd.to_numeric(h, errors="coerce").values,
-            f"{prefix}_low": pd.to_numeric(l, errors="coerce").values,
-            f"{prefix}_close": pd.to_numeric(c, errors="coerce").values,
-        })
-
-        if out is None:
-            out = df_one
-        else:
-            out = out.merge(df_one, on="date", how="outer")
-
-    assert out is not None
-    out = out.sort_values("date").reset_index(drop=True)
-    return out
-
-
-# -----------------------------
-# Señales y estado
-# -----------------------------
-
-def compute_features(df: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
-    w = df.copy()
-    _ensure_expected_columns(w, ["date", "vix", "vxn", "vixy", "spy"])
-
-    w["vix"] = _safe_num_series(w["vix"])
-    w["vxn"] = _safe_num_series(w["vxn"])
-    w["vixy"] = _safe_num_series(w["vixy"])
-    w["spy"] = _safe_num_series(w["spy"])
-
-    # retorno SPY
-    w["spy_ret"] = w["spy"].pct_change()
-
-    # ratio VXN/VIX + dirección
-    w["vxn_vix_ratio"] = w["vxn"] / w["vix"]
-    w["ratio_up"] = w["vxn_vix_ratio"].diff() > 0
-
-    lb = int(cfg.lookback_pct)
-    w["vix_p10"] = w["vix"].rolling(lb).quantile(0.10)
-    w["vix_p25"] = w["vix"].rolling(lb).quantile(0.25)
-    w["vix_p50"] = w["vix"].rolling(lb).quantile(0.50)
-    w["vix_p65"] = w["vix"].rolling(lb).quantile(0.65)
-    w["vix_p85"] = w["vix"].rolling(lb).quantile(0.85)
-
-    # MA sobre vixy (que ahora contiene VXX como proxy)
-    w["vixy_ma_3"] = w["vixy"].rolling(3).mean()
-    w["vixy_ma_10"] = w["vixy"].rolling(10).mean()
-
-    w["contango_ok"] = w["vixy_ma_3"] < w["vixy_ma_10"]
-    return w
-
-
-def decide_state_row(row: pd.Series, cfg: VixConfig = DEFAULT_CFG) -> Dict[str, Any]:
-    vix = row.get("vix")
-    p25 = row.get("vix_p25")
-    p65 = row.get("vix_p65")
-    p85 = row.get("vix_p85")
-
-    ratio = row.get("vxn_vix_ratio")
-    ratio_up = bool(row.get("ratio_up")) if pd.notna(row.get("ratio_up")) else False
-    contango_ok = bool(row.get("contango_ok")) if pd.notna(row.get("contango_ok")) else False
-    spy_ret = row.get("spy_ret")
-    macro_tomorrow = bool(row.get("macro_tomorrow")) if pd.notna(row.get("macro_tomorrow")) else False
-
-    if pd.isna(p25) or pd.isna(p65) or pd.isna(p85) or pd.isna(vix):
-        return {"estado": "NEUTRAL", "accion": "NO DATA", "comentario": "Insuficiente histórico para rolling 252."}
-
-    if cfg.use_guardrail and pd.notna(vix) and float(vix) < float(cfg.guardrail_vix_floor):
-        return {
-            "estado": "NEUTRAL",
-            "accion": "NO OPEN SVIX",
-            "comentario": "Guardarraíl: VIX extremadamente bajo (riesgo snapback).",
-        }
-
-    # -----------------------------
-    # SVIX (NO tocado aquí)
-    # -----------------------------
-    cond_svix = (
-        (vix < p25)
-        and (pd.notna(ratio) and ratio < cfg.ratio_ok)
-        and contango_ok
-        and (macro_tomorrow is False)
-    )
-    if cond_svix:
-        return {"estado": "SVIX", "accion": "OPEN/HOLD SVIX", "comentario": "Calma + contango + sin macro mañana."}
-
-    # -----------------------------
-    # UVIX — PÁNICO REAL (estricto)
-    #   - Requiere VIX > p85
-    #   - Requiere score >= 3 (de 4)
-    #   - Requiere confirmación adicional:
-    #       * SPY_ret <= -1.2%  OR  estructura tensa (MA3 > MA10)
-    # -----------------------------
-    uvix_cond1 = bool(pd.notna(vix) and pd.notna(p65) and (vix > p65))
-    uvix_cond2 = bool(pd.notna(ratio) and (ratio > cfg.ratio_alert) and ratio_up)
-    uvix_cond3 = bool(
-        pd.notna(row.get("vixy_ma_3"))
-        and pd.notna(row.get("vixy_ma_10"))
-        and (row.get("vixy_ma_3") > row.get("vixy_ma_10"))
-    )
-    uvix_cond4 = bool(pd.notna(spy_ret) and (spy_ret < -0.008))  # condición “suave” para el score
-
-    uvix_score = sum([uvix_cond1, uvix_cond2, uvix_cond3, uvix_cond4])
-
-    # Confirmación “pánico real”
-    panic_vix_extreme = bool(pd.notna(vix) and pd.notna(p85) and (vix > p85))
-    panic_confirm = bool(
-        (pd.notna(spy_ret) and (spy_ret <= -0.012))  # -1.2%
-        or uvix_cond3                                # estructura tensa
-    )
-
-    if panic_vix_extreme and (uvix_score >= 3) and panic_confirm:
-        return {"estado": "UVIX", "accion": "OPEN/HOLD UVIX", "comentario": f"PÁNICO REAL: score={uvix_score}, VIX>p85."}
-
-    # PREP_SVIX
-    cond_prep = (vix > p85) and (ratio_up is False) and contango_ok
-    if cond_prep:
-        return {"estado": "PREP_SVIX", "accion": "WAIT / PREPARE SVIX", "comentario": "Pánico se agota + contango vuelve."}
-
-    return {"estado": "NEUTRAL", "accion": "NO NEW POSITION", "comentario": "Régimen mixto / transición."}
-
-
-def compute_states(df_feat: pd.DataFrame, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
-    w = df_feat.copy()
-
-    macro = fetch_macro_events()
-    w["macro_tomorrow"] = w["date"].apply(
-        lambda d: macro_tomorrow_flag(pd.to_datetime(d), macro) if pd.notna(d) else False
-    )
-
-    estados, acciones, comentarios = [], [], []
-    for _, r in w.iterrows():
-        res = decide_state_row(r, cfg=cfg)
-        estados.append(res["estado"])
-        acciones.append(res["accion"])
-        comentarios.append(res["comentario"])
-
-    w["estado"] = estados
-    w["accion"] = acciones
-    w["comentario"] = comentarios
-    return w
-
-
-# -----------------------------
-# Supabase: vix_daily (única tabla)
-# -----------------------------
-
-def upsert_vix_daily(df: pd.DataFrame) -> int:
-    if df.empty:
-        return 0
-
-    w = df.copy()
-    w["fecha"] = pd.to_datetime(w["date"], errors="coerce").dt.date
-
-    keep_cols = [
-        "fecha",
-        "vix", "vxn", "vixy", "spy",
-        "spy_ret",
-        "vxn_vix_ratio",
-        "vix_p10", "vix_p25", "vix_p50", "vix_p65", "vix_p85",
-        "vixy_ma_3", "vixy_ma_10",
-        "contango_ok",
-        "macro_tomorrow",
-        "estado", "accion", "comentario",
-        "svix_open", "svix_high", "svix_low", "svix_close",
-        "uvix_open", "uvix_high", "uvix_low", "uvix_close",
-    ]
-    w = w[[c for c in keep_cols if c in w.columns]].copy()
-
-    records: List[Dict[str, Any]] = w.to_dict(orient="records")
-    records = _json_sanitize_records(records)
-
-    resp = supabase.table("vix_daily").upsert(records, on_conflict="fecha").execute()
+def _insert_position(payload: Dict[str, Any]) -> int:
+    payload = _sanitize_payload(payload)
+    resp = supabase.table("vix_positions").insert(payload).execute()
     if getattr(resp, "error", None):
         raise RuntimeError(resp.error)
-
-    return len(records)
-
-
-def fetch_vix_daily() -> pd.DataFrame:
-    # ✅ IMPORTANTE: paginamos para no quedarnos en 1000 filas
-    data = _supabase_select_all(table="vix_daily", order_col="fecha", asc=True, batch_size=1000)
-    df = pd.DataFrame(data)
-    if not df.empty and "fecha" in df.columns:
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-    return df
-
-
-# -----------------------------
-# Órdenes VIX (Supabase)
-# -----------------------------
-
-def fetch_vix_orders(limit: int = 300) -> pd.DataFrame:
-    # Si pides pocas (limit), usamos el endpoint normal.
-    if limit <= 1000:
-        resp = supabase.table("vix_orders").select("*").order("fecha", desc=True).limit(limit).execute()
-        if getattr(resp, "error", None):
-            raise RuntimeError(resp.error)
-        data = getattr(resp, "data", None) or []
-        df = pd.DataFrame(data)
-        if not df.empty and "fecha" in df.columns:
-            df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-        return df
-
-    # Si algún día quieres más de 1000, también paginamos:
-    data = _supabase_select_all(table="vix_orders", order_col="fecha", asc=False, batch_size=1000)
-    df = pd.DataFrame(data)
-    if not df.empty and "fecha" in df.columns:
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-    return df
-
-
-def insert_vix_order(
-    fecha,
-    ticker: str,
-    side: str,
-    qty: float,
-    price: Optional[float] = None,
-    status: str = "PLANNED",
-    notes: Optional[str] = None,
-    estado_signal: Optional[str] = None,
-) -> int:
-    payload: Dict[str, Any] = {
-        "fecha": pd.to_datetime(fecha, errors="coerce").date().isoformat() if fecha is not None else None,
-        "ticker": ticker,
-        "side": side,
-        "qty": float(qty),
-        "price": float(price) if price is not None else None,
-        "status": status,
-        "notes": notes,
-        "estado_signal": estado_signal,
-    }
-    payload = {k: _json_sanitize_value(v) for k, v in payload.items()}
-
-    resp = supabase.table("vix_orders").insert(payload).execute()
-    if getattr(resp, "error", None):
-        raise RuntimeError(resp.error)
-
     data = getattr(resp, "data", None) or []
     if data and isinstance(data, list) and "id" in data[0]:
         return int(data[0]["id"])
     return 1
 
 
-def update_vix_order_status(
-    order_id: int,
-    status: str,
-    price: Optional[float] = None,
-    notes: Optional[str] = None,
-) -> None:
-    patch: Dict[str, Any] = {"status": status}
-    if price is not None:
-        patch["price"] = float(price)
-    if notes is not None:
-        patch["notes"] = notes
-
-    patch = {k: _json_sanitize_value(v) for k, v in patch.items()}
-
-    resp = supabase.table("vix_orders").update(patch).eq("id", int(order_id)).execute()
+def _update_position(pos_id: int, patch: Dict[str, Any]) -> None:
+    patch = _sanitize_payload(patch)
+    resp = supabase.table("vix_positions").update(patch).eq("id", int(pos_id)).execute()
     if getattr(resp, "error", None):
         raise RuntimeError(resp.error)
 
 
-# -----------------------------
-# Pipeline 1-click
-# -----------------------------
+def _already_has_position_for_entry(ticker: str, entry_date_iso: str) -> bool:
+    """
+    Blindaje contra duplicados aunque NO exista índice UNIQUE.
+    """
+    resp = (
+        supabase.table("vix_positions")
+        .select("id")
+        .eq("ticker", ticker)
+        .eq("entry_date", entry_date_iso)
+        .limit(1)
+        .execute()
+    )
+    if getattr(resp, "error", None):
+        raise RuntimeError(resp.error)
+    data = getattr(resp, "data", None) or []
+    return len(data) > 0
 
-def run_vix_pipeline(start: str, end: str, cfg: VixConfig = DEFAULT_CFG) -> pd.DataFrame:
-    raw = download_yahoo_daily(start=start, end=end)
-    feat = compute_features(raw, cfg=cfg)
-    out = compute_states(feat, cfg=cfg)
 
-    # merge OHLC operables (SVIX/UVIX)
-    ohlc = download_trade_ohlc(start=start, end=end)
-    if ohlc is not None and not ohlc.empty:
-        out = out.merge(ohlc, on="date", how="left")
+# ============================================================
+# Motor principal
+# ============================================================
 
-    upsert_vix_daily(out)
-    return out
+def run_vix_execution() -> None:
+    """
+    Motor: lee vix_daily + posiciones y aplica reglas.
+    - NO reabre ticker si ya está OPEN
+    - NO crea trade si no hay open del ticker ese día
+    - Blindaje duplicados: no inserta si ya existe ticker+entry_date
+    """
+
+    daily = fetch_vix_daily()
+    if daily is None or daily.empty:
+        return
+
+    if "fecha" not in daily.columns:
+        raise RuntimeError("vix_daily no tiene columna 'fecha'")
+
+    daily = daily.copy()
+    daily["fecha"] = pd.to_datetime(daily["fecha"], errors="coerce").dt.normalize()
+    daily = daily.dropna(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
+
+    # posiciones actuales
+    pos_df = fetch_vix_positions(limit=2000)
+    if pos_df.empty:
+        pos_df = pd.DataFrame(columns=[
+            "id","ticker","status","entry_signal_date","entry_date","entry_price","qty","capital_usd",
+            "stop_pct","tp1_pct","trailing_pct","tp1_taken","trailing_active",
+            "hard_stop_price","tp1_price","trail_price","high_watermark",
+            "exit_date","exit_price","pl_usd","pl_pct","notes",
+        ])
+
+    # OPEN por ticker
+    open_pos: Dict[str, Dict[str, Any]] = {}
+    if "status" in pos_df.columns and "ticker" in pos_df.columns and not pos_df.empty:
+        for tkr in ["UVIX", "SVIX"]:
+            w = pos_df[(pos_df["ticker"] == tkr) & (pos_df["status"] == "OPEN")].copy()
+            if not w.empty:
+                w = w.sort_values("entry_date", ascending=False)
+                open_pos[tkr] = w.iloc[0].to_dict()
+
+    # Iteración diaria (prev -> señal, cur -> ejecución)
+    for i in range(1, len(daily)):
+        prev = daily.iloc[i - 1]
+        cur = daily.iloc[i]
+
+        prev_state = str(prev.get("estado", "NEUTRAL") or "NEUTRAL").upper().strip()
+        cur_date = _to_date(cur.get("fecha"))
+        if cur_date is None:
+            continue
+
+        # =========================
+        # ENTRADAS (si no hay OPEN)
+        # =========================
+        for tkr in ["UVIX", "SVIX"]:
+            if tkr in open_pos:
+                continue
+
+            if prev_state != tkr:
+                continue
+
+            o, h, l, c = _get_ohlc_for_ticker(cur, tkr)
+            if o is None:
+                continue  # sin open, no hay entrada
+
+            rules = RULES_BY_TICKER.get(tkr)
+            if rules is None:
+                continue
+
+            entry_date_iso = cur_date.date().isoformat()
+
+            # blindaje duplicados
+            if _already_has_position_for_entry(tkr, entry_date_iso):
+                continue
+
+            entry_price = float(o)
+            capital_usd = 10000.0
+            qty = capital_usd / entry_price if entry_price > 0 else 0.0
+
+            hard_stop_price = entry_price * (1.0 - rules.stop_pct)
+            tp1_price = entry_price * (1.0 + rules.tp1_pct)
+
+            prev_fecha = _to_date(prev.get("fecha"))
+            payload = {
+                "ticker": tkr,
+                "status": "OPEN",
+                "entry_signal_date": prev_fecha.date().isoformat() if prev_fecha is not None else None,
+                "entry_date": entry_date_iso,
+                "entry_price": entry_price,
+                "qty": qty,
+                "capital_usd": capital_usd,
+                "stop_pct": rules.stop_pct,
+                "tp1_pct": rules.tp1_pct,
+                "trailing_pct": rules.trailing_pct,
+                "tp1_taken": False,
+                "trailing_active": False,
+                "hard_stop_price": hard_stop_price,
+                "tp1_price": tp1_price,
+                "trail_price": None,
+                "high_watermark": entry_price,
+                "notes": f"Auto-entry. prev_estado={prev_state}",
+            }
+
+            new_id = _insert_position(payload)
+            payload["id"] = new_id
+            open_pos[tkr] = payload
+
+        # =========================
+        # GESTIÓN DE POSICIONES OPEN
+        # =========================
+        for tkr, pos in list(open_pos.items()):
+            if str(pos.get("status", "")).upper().strip() != "OPEN":
+                continue
+
+            entry_date = _to_date(pos.get("entry_date"))
+            if entry_date is None:
+                continue
+
+            rules = RULES_BY_TICKER.get(tkr)
+            if rules is None:
+                continue
+
+            days_in_trade = (cur_date - entry_date).days
+            allow_exits = days_in_trade >= rules.min_hold_days
+
+            entry_price = float(pos.get("entry_price") or 0.0)
+            qty = float(pos.get("qty") or 0.0)
+
+            hard_stop_price = _num(pos.get("hard_stop_price"))
+            tp1_price = _num(pos.get("tp1_price"))
+            trailing_pct = float(pos.get("trailing_pct") or rules.trailing_pct)
+
+            tp1_taken = bool(pos.get("tp1_taken") is True)
+            trailing_active = bool(pos.get("trailing_active") is True)
+            high_watermark = _num(pos.get("high_watermark")) or entry_price
+
+            o, h, l, c = _get_ohlc_for_ticker(cur, tkr)
+            if o is None and h is None and l is None and c is None:
+                continue
+
+            # high watermark
+            if h is not None:
+                high_watermark = max(high_watermark, float(h))
+
+            # trailing price si activo
+            trail_price = _num(pos.get("trail_price"))
+            if trailing_active:
+                trail_price = high_watermark * (1.0 - trailing_pct)
+
+            exit_reason = None
+            exit_price = None
+
+            # 1) HARD STOP (siempre)
+            if hard_stop_price is not None:
+                if o is not None and float(o) <= float(hard_stop_price):
+                    exit_reason = "HARD_STOP_GAP"
+                    exit_price = float(o)
+                elif l is not None and float(l) <= float(hard_stop_price):
+                    exit_reason = "HARD_STOP"
+                    exit_price = float(hard_stop_price)
+
+            # 2) TP1 (si allow_exits)
+            tp1_exec = False
+            if exit_reason is None and allow_exits and (not tp1_taken) and tp1_price is not None:
+                if h is not None and float(h) >= float(tp1_price):
+                    tp1_exec = True
+
+            # 3) Trailing (si allow_exits + activo)
+            if exit_reason is None and allow_exits and trailing_active and trail_price is not None:
+                if o is not None and float(o) <= float(trail_price):
+                    exit_reason = "TRAIL_GAP"
+                    exit_price = float(o)
+                elif l is not None and float(l) <= float(trail_price):
+                    exit_reason = "TRAIL"
+                    exit_price = float(trail_price)
+
+            # 4) Time stop si no hay TP1
+            if exit_reason is None and allow_exits and (not tp1_taken):
+                if days_in_trade >= rules.max_hold_days_no_tp1:
+                    if c is not None and entry_price > 0:
+                        if float(c) < entry_price * (1.0 + rules.min_gain_to_keep_after_maxhold):
+                            exit_reason = "TIME_STOP"
+                            exit_price = float(c)
+
+            # 5) Regime exit UVIX (si deja de ser UVIX 2 días seguidos)
+            if exit_reason is None and allow_exits:
+                cur_state = str(cur.get("estado", "NEUTRAL") or "NEUTRAL").upper().strip()
+                prev2_state = str(prev.get("estado", "NEUTRAL") or "NEUTRAL").upper().strip()
+                if tkr == "UVIX":
+                    if (prev2_state != "UVIX") and (cur_state != "UVIX"):
+                        if o is not None:
+                            exit_reason = "REGIME_OFF"
+                            exit_price = float(o)
+
+            # aplicar TP1
+            if tp1_exec:
+                qty_left = qty * (1.0 - rules.tp1_take)
+                _update_position(int(pos["id"]), {
+                    "tp1_taken": True,
+                    "trailing_active": True,
+                    "high_watermark": high_watermark,
+                    "trail_price": high_watermark * (1.0 - trailing_pct),
+                    "qty": qty_left,
+                    "notes": (str(pos.get("notes") or "") + f" | TP1 hit @ {tp1_price:.4f}").strip(),
+                })
+                pos["tp1_taken"] = True
+                pos["trailing_active"] = True
+                pos["high_watermark"] = high_watermark
+                pos["trail_price"] = high_watermark * (1.0 - trailing_pct)
+                pos["qty"] = qty_left
+
+            # cerrar si toca
+            if exit_reason is not None and exit_price is not None:
+                qty_now = float(pos.get("qty") or 0.0)
+                pl_usd = (float(exit_price) - entry_price) * qty_now
+                pl_pct = (float(exit_price) / entry_price - 1.0) if entry_price > 0 else None
+
+                _update_position(int(pos["id"]), {
+                    "status": "CLOSED",
+                    "exit_date": cur_date.date().isoformat(),
+                    "exit_price": float(exit_price),
+                    "pl_usd": float(pl_usd),
+                    "pl_pct": float(pl_pct) if pl_pct is not None else None,
+                    "high_watermark": high_watermark,
+                    "trail_price": trail_price,
+                    "notes": (str(pos.get("notes") or "") + f" | EXIT {exit_reason} @ {exit_price:.4f}").strip(),
+                })
+
+                open_pos.pop(tkr, None)
+                continue
+
+            # si sigue OPEN: actualizar watermark/trail
+            patch = {"high_watermark": high_watermark}
+            if trailing_active:
+                patch["trail_price"] = high_watermark * (1.0 - trailing_pct)
+
+            _update_position(int(pos["id"]), patch)
+
+            pos["high_watermark"] = high_watermark
+            if trailing_active:
+                pos["trail_price"] = patch.get("trail_price")
+
+
+# ✅ compatibilidad: por si en algún sitio viejo llamas a run_execution
+def run_execution() -> None:
+    run_vix_execution()
