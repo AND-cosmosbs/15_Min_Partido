@@ -26,17 +26,25 @@ class VixConfig:
     guardrail_vix_floor: float = 12.5  # si VIX < 12.5 => no abrir SVIX
 
     # --- UVIX: PÁNICO REAL (muy pocos trades) ---
+
     # caída SPY mínima para considerar pánico
-    uvix_spy_panic_ret: float = -0.018  # -1.8% día SPY (más duro)
+    uvix_spy_panic_ret: float = -0.020  # -2.0% día SPY (más duro y más "crash day")
 
     # VIX debe ser extremo (p85) y además alto en absoluto
-    uvix_vix_abs_floor: float = 28.0    # VIX >= 28
+    uvix_vix_abs_floor: float = 30.0    # VIX >= 30 (más duro)
+
+    # VIX debe estar "claramente" por encima del p85 (margen para evitar ruido)
+    uvix_p85_margin: float = 1.10       # VIX >= p85 * 1.10
 
     # ratio VXN/VIX debe estar alto y subiendo (stress tech)
-    uvix_ratio_floor: float = 1.35      # ratio >= 1.35
+    uvix_ratio_floor: float = 1.38      # ratio >= 1.38 (más duro)
 
     # estructura tensa con margen (evita ruido)
-    uvix_struct_margin: float = 1.02    # MA3 > MA10 * 1.02 (+2%)
+    uvix_struct_margin: float = 1.03    # MA3 > MA10 * 1.03 (+3%)
+
+    # filtro extra “shock”: VIX debe pegar salto (porcentaje o puntos)
+    uvix_vix_ret_jump: float = 0.12     # +12% en VIX vs ayer
+    uvix_vix_abs_jump: float = 3.0      # o +3 puntos en VIX vs ayer
 
 
 DEFAULT_CFG = VixConfig()
@@ -348,6 +356,10 @@ def compute_features(df: pd.DataFrame, cfg: Optional[VixConfig] = None) -> pd.Da
     w["vxn_vix_ratio"] = w["vxn"] / w["vix"]
     w["ratio_up"] = w["vxn_vix_ratio"].diff() > 0
 
+    # extras para endurecer UVIX sin tocar schema (no se persisten)
+    w["vix_ret"] = w["vix"].pct_change()
+    w["vix_chg"] = w["vix"].diff()
+
     lb = int(cfg.lookback_pct)
     w["vix_p10"] = w["vix"].rolling(lb).quantile(0.10)
     w["vix_p25"] = w["vix"].rolling(lb).quantile(0.25)
@@ -404,20 +416,28 @@ def decide_state_row(row: pd.Series, cfg: Optional[VixConfig] = None) -> Dict[st
         and spy_filter_ok
     )
     if cond_svix:
-        return {"estado": "SVIX", "accion": "OPEN/HOLD SVIX", "comentario": "Calma extrema + contango + SPY ok + sin macro mañana."}
+        return {
+            "estado": "SVIX",
+            "accion": "OPEN/HOLD SVIX",
+            "comentario": "Calma extrema + contango + SPY ok + sin macro mañana.",
+        }
 
     # ---------------------------------------------------------
     # UVIX (PÁNICO REAL = MUY POCOS TRADES)
-    # ALL-OF + umbral absoluto + margen estructura + filtro macro
+    # ALL-OF + umbral absoluto + margen sobre p85 + shock VIX + filtro macro
     # ---------------------------------------------------------
-    uvix_vix_extreme = (pd.notna(vix) and pd.notna(p85) and (float(vix) > float(p85)))
+    # VIX extremo y alto
+    uvix_vix_extreme = (pd.notna(vix) and pd.notna(p85) and (float(vix) >= float(p85) * float(cfg.uvix_p85_margin)))
     uvix_vix_abs = (pd.notna(vix) and float(vix) >= float(cfg.uvix_vix_abs_floor))
     uvix_vix = uvix_vix_extreme and uvix_vix_abs
 
+    # SPY crash day
     uvix_spy = (pd.notna(spy_ret) and float(spy_ret) <= float(cfg.uvix_spy_panic_ret))
 
+    # ratio stress tech y acelerando
     uvix_ratio = (pd.notna(ratio) and float(ratio) >= float(cfg.uvix_ratio_floor) and ratio_up)
 
+    # estructura realmente tensa (backwardation proxy fuerte)
     ma3 = row.get("vixy_ma_3")
     ma10 = row.get("vixy_ma_10")
     uvix_struct = (
@@ -425,19 +445,35 @@ def decide_state_row(row: pd.Series, cfg: Optional[VixConfig] = None) -> Dict[st
         and float(ma3) > float(ma10) * float(cfg.uvix_struct_margin)
     )
 
+    # shock VIX (salto fuerte)
+    vix_ret = row.get("vix_ret")
+    vix_chg = row.get("vix_chg")
+    uvix_shock = False
+    if pd.notna(vix_ret) and float(vix_ret) >= float(cfg.uvix_vix_ret_jump):
+        uvix_shock = True
+    if pd.notna(vix_chg) and float(vix_chg) >= float(cfg.uvix_vix_abs_jump):
+        uvix_shock = True
+
     uvix_macro_ok = (macro_tomorrow is False)
 
-    if uvix_vix and uvix_spy and uvix_ratio and uvix_struct and uvix_macro_ok:
+    if uvix_vix and uvix_spy and uvix_ratio and uvix_struct and uvix_shock and uvix_macro_ok:
         return {
             "estado": "UVIX",
             "accion": "OPEN/HOLD UVIX",
-            "comentario": "PÁNICO REAL: VIX extremo+alto, SPY crash, ratio alto/acel, estructura tensa, sin macro mañana.",
+            "comentario": (
+                "PÁNICO REAL: VIX extremo+alto (sobre p85 con margen), SPY crash, ratio alto/acel, "
+                "estructura tensa, shock VIX, sin macro mañana."
+            ),
         }
 
     # PREP_SVIX
     cond_prep = (pd.notna(vix) and pd.notna(p85) and (vix > p85)) and (ratio_up is False) and contango_ok
     if cond_prep:
-        return {"estado": "PREP_SVIX", "accion": "WAIT / PREPARE SVIX", "comentario": "Pánico se agota + contango vuelve."}
+        return {
+            "estado": "PREP_SVIX",
+            "accion": "WAIT / PREPARE SVIX",
+            "comentario": "Pánico se agota + contango vuelve.",
+        }
 
     return {"estado": "NEUTRAL", "accion": "NO NEW POSITION", "comentario": "Régimen mixto / transición."}
 
